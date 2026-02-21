@@ -12,19 +12,50 @@ pub unsafe fn handle_query(
     let type_ = (*desc).type_;
 
     match type_ {
-        FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE => {
-            query_upscale_ratio(desc)
-        }
+        FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE => query_upscale_ratio(desc),
         FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE => {
             query_render_resolution(desc)
         }
         FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT => query_jitter_phase_count(desc),
         FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET => query_jitter_offset(desc),
+        FFX_API_QUERY_DESC_TYPE_GET_VERSIONS => query_get_versions(desc),
         _ => {
             warn!(type_ = type_, "ffxQuery: unknown descriptor type");
             FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE
         }
     }
+}
+
+static OXR_VERSION_NAME: &[u8] = b"OXR Upscaler 1.0\0";
+const OXR_VERSION_ID: u64 = 1;
+
+unsafe fn query_get_versions(desc: *mut ffxQueryDescHeader) -> ffxReturnCode_t {
+    let d = &mut *(desc as *mut ffxQueryDescGetVersions);
+
+    info!(
+        create_desc_type = format_args!("{:#010x}", d.create_desc_type),
+        "ffxQuery: GetVersions"
+    );
+
+    if d.output_count.is_null() {
+        return FFX_API_RETURN_OK;
+    }
+
+    let capacity = *d.output_count;
+    *d.output_count = 1; // we always have exactly 1 version
+
+    if capacity == 0 {
+        return FFX_API_RETURN_OK; // caller just wanted the count
+    }
+
+    if !d.version_ids.is_null() {
+        *d.version_ids = OXR_VERSION_ID;
+    }
+    if !d.version_names.is_null() {
+        *d.version_names = OXR_VERSION_NAME.as_ptr() as *const i8;
+    }
+
+    FFX_API_RETURN_OK
 }
 
 /// Standard FSR upscale ratios per quality mode.

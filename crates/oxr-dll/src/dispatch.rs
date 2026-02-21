@@ -61,16 +61,14 @@ unsafe fn dispatch_upscale(desc: *const ffxDispatchDescHeader) -> ffxReturnCode_
     };
 
     let color_res: ID3D12Resource = {
-        let borrowed: &ID3D12Resource =
-            windows::core::Interface::from_raw_borrowed(&color_raw)
-                .expect("invalid color resource pointer");
+        let borrowed: &ID3D12Resource = windows::core::Interface::from_raw_borrowed(&color_raw)
+            .expect("invalid color resource pointer");
         borrowed.clone()
     };
 
     let output_res: ID3D12Resource = {
-        let borrowed: &ID3D12Resource =
-            windows::core::Interface::from_raw_borrowed(&output_raw)
-                .expect("invalid output resource pointer");
+        let borrowed: &ID3D12Resource = windows::core::Interface::from_raw_borrowed(&output_raw)
+            .expect("invalid output resource pointer");
         borrowed.clone()
     };
 
@@ -102,18 +100,18 @@ unsafe fn dispatch_upscale(desc: *const ffxDispatchDescHeader) -> ffxReturnCode_
 
     // Build copy locations without AddRef (transmute_copy borrows the pointer).
     let src_loc = D3D12_TEXTURE_COPY_LOCATION {
-        pResource: std::mem::ManuallyDrop::new(unsafe {
-            std::mem::transmute_copy(&color_res)
-        }),
+        pResource: std::mem::ManuallyDrop::new(unsafe { std::mem::transmute_copy(&color_res) }),
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: 0,
+        },
     };
     let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
-        pResource: std::mem::ManuallyDrop::new(unsafe {
-            std::mem::transmute_copy(&output_res)
-        }),
+        pResource: std::mem::ManuallyDrop::new(unsafe { std::mem::transmute_copy(&output_res) }),
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: 0,
+        },
     };
     let src_box = D3D12_BOX {
         left: 0,

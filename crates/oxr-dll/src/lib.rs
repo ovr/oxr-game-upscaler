@@ -11,11 +11,7 @@ use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 
 #[no_mangle]
-unsafe extern "system" fn DllMain(
-    _hinst: HINSTANCE,
-    call_reason: u32,
-    _reserved: *mut (),
-) -> bool {
+unsafe extern "system" fn DllMain(_hinst: HINSTANCE, call_reason: u32, _reserved: *mut ()) -> bool {
     match call_reason {
         DLL_PROCESS_ATTACH => {
             logging::init();

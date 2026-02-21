@@ -62,7 +62,8 @@ pub type ffxDispatchDescHeader = ffxApiHeader;
 
 // ---- Allocation callbacks ----
 
-pub type FfxAlloc = Option<unsafe extern "C" fn(p_user_data: *mut c_void, size: u64) -> *mut c_void>;
+pub type FfxAlloc =
+    Option<unsafe extern "C" fn(p_user_data: *mut c_void, size: u64) -> *mut c_void>;
 pub type FfxDealloc = Option<unsafe extern "C" fn(p_user_data: *mut c_void, p_mem: *mut c_void)>;
 
 #[repr(C)]
@@ -96,13 +97,28 @@ pub struct ffxConfigureDescGlobalDebug1 {
     pub debug_level: u32,
 }
 
+// ---- GetVersions query descriptor ----
+
+#[repr(C)]
+pub struct ffxQueryDescGetVersions {
+    pub header: ffxQueryDescHeader,
+    pub create_desc_type: u64,
+    pub device: *mut c_void,
+    pub output_count: *mut u64,
+    pub version_ids: *mut u64,
+    pub version_names: *mut *const i8, // const char**
+}
+
 // ---- Helper: walk pNext chain ----
 
 /// Walk the descriptor chain and find the first header with the given type.
 ///
 /// # Safety
 /// All pointers in the chain must be valid.
-pub unsafe fn find_desc(mut header: *const ffxApiHeader, type_: ffxStructType_t) -> *const ffxApiHeader {
+pub unsafe fn find_desc(
+    mut header: *const ffxApiHeader,
+    type_: ffxStructType_t,
+) -> *const ffxApiHeader {
     while !header.is_null() {
         if (*header).type_ == type_ {
             return header;
