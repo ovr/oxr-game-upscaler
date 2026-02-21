@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 mod dispatch;
 mod fsr3_types;
+mod gpu_pipeline;
 mod logging;
 
 use core::ffi::c_void;
