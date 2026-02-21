@@ -1,6 +1,9 @@
 #![allow(non_snake_case)]
+mod fsr3_types;
 mod logging;
+
 use core::ffi::c_void;
+use fsr3_types::*;
 use std::sync::OnceLock;
 use tracing::info;
 use windows::core::PCSTR;
@@ -9,16 +12,28 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 
 struct FnTable {
-    ContextCreate: unsafe extern "C" fn(*mut c_void, *const c_void) -> u32,
-    ContextDestroy: unsafe extern "C" fn(*mut c_void) -> u32,
-    ContextDispatch: unsafe extern "C" fn(*mut c_void, *const c_void) -> u32,
-    GenReactiveMask: unsafe extern "C" fn(*mut c_void, *const c_void) -> u32,
+    ContextCreate: unsafe extern "C" fn(
+        *mut FfxFsr3UpscalerContext,
+        *const FfxFsr3UpscalerContextDescription,
+    ) -> u32,
+    ContextDestroy: unsafe extern "C" fn(*mut FfxFsr3UpscalerContext) -> u32,
+    ContextDispatch: unsafe extern "C" fn(
+        *mut FfxFsr3UpscalerContext,
+        *const FfxFsr3UpscalerDispatchDescription,
+    ) -> u32,
+    GenReactiveMask: unsafe extern "C" fn(
+        *mut FfxFsr3UpscalerContext,
+        *const FfxFsr3UpscalerGenerateReactiveDescription,
+    ) -> u32,
     GetJitterOffset: unsafe extern "C" fn(*mut f32, *mut f32, i32, i32) -> u32,
     GetJitterPhCount: unsafe extern "C" fn(i32, i32) -> i32,
     GetRenderRes: unsafe extern "C" fn(*mut u32, *mut u32, u32, u32, u32) -> u32,
-    GetSharedResDesc: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32,
+    GetSharedResDesc: unsafe extern "C" fn(
+        *mut FfxFsr3UpscalerContext,
+        *mut FfxFsr3UpscalerSharedResourceDescriptions,
+    ) -> u32,
     GetUpscaleRatio: unsafe extern "C" fn(u32) -> f32,
-    ResourceIsNull: unsafe extern "C" fn(*const c_void) -> u32,
+    ResourceIsNull: unsafe extern "C" fn(FfxResource) -> u32,
     SafeRelCopy: unsafe extern "C" fn(*mut c_void, *const c_void, u32),
     SafeRelPipeline: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
     SafeRelResource: unsafe extern "C" fn(*mut c_void, *const c_void, u32),
@@ -117,39 +132,30 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut ()) -> bool
 
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerContextCreate(
-    ctx: *mut c_void,
-    desc: *const c_void,
+    ctx: *mut FfxFsr3UpscalerContext,
+    desc: *const FfxFsr3UpscalerContextDescription,
 ) -> u32 {
     info!("ffxFsr3UpscalerContextCreate");
     (FN_TABLE.get().unwrap().ContextCreate)(ctx, desc)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ffxFsr3UpscalerContextDestroy(ctx: *mut c_void) -> u32 {
+pub unsafe extern "C" fn ffxFsr3UpscalerContextDestroy(ctx: *mut FfxFsr3UpscalerContext) -> u32 {
     info!("ffxFsr3UpscalerContextDestroy");
     (FN_TABLE.get().unwrap().ContextDestroy)(ctx)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
-    ctx: *mut c_void,
-    desc: *const c_void,
+    ctx: *mut FfxFsr3UpscalerContext,
+    desc: *const FfxFsr3UpscalerDispatchDescription,
 ) -> u32 {
     if !desc.is_null() {
-        let base = desc as *const u8;
-        // Old-SDK FfxFsr3UpscalerDispatchDescription layout (FfxResource = 176 bytes):
-        //   offset 0:    commandList (void*, 8 bytes)
-        //   offset 8:    10 × FfxResource (176 bytes each) = 1760 bytes
-        //   offset 1768: jitterOffset (2×f32)
-        //   offset 1776: motionVectorScale (2×f32)
-        //   offset 1784: renderSize (2×u32)
-        //   offset 1792: enableSharpening (bool, no upscaleSize field)
-        // Output resource (#9) starts at 8 + 9×176 = 1592;
-        //   description.width at 1592+16 = 1608, height at 1612 → upscale dimensions.
-        let rw = *(base.add(1784) as *const u32);
-        let rh = *(base.add(1788) as *const u32);
-        let uw = *(base.add(1608) as *const u32);
-        let uh = *(base.add(1612) as *const u32);
+        let d = &*desc;
+        let rw = d.render_size.width;
+        let rh = d.render_size.height;
+        let uw = d.output.description.width;
+        let uh = d.output.description.height;
         info!(
             render = format_args!("{}x{}", rw, rh),
             upscale = format_args!("{}x{}", uw, uh),
@@ -161,8 +167,8 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
 
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerContextGenerateReactiveMask(
-    ctx: *mut c_void,
-    desc: *const c_void,
+    ctx: *mut FfxFsr3UpscalerContext,
+    desc: *const FfxFsr3UpscalerGenerateReactiveDescription,
 ) -> u32 {
     (FN_TABLE.get().unwrap().GenReactiveMask)(ctx, desc)
 }
@@ -195,8 +201,8 @@ pub unsafe extern "C" fn ffxFsr3UpscalerGetRenderResolutionFromQualityMode(
 
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerGetSharedResourceDescriptions(
-    ctx: *mut c_void,
-    desc: *mut c_void,
+    ctx: *mut FfxFsr3UpscalerContext,
+    desc: *mut FfxFsr3UpscalerSharedResourceDescriptions,
 ) -> u32 {
     (FN_TABLE.get().unwrap().GetSharedResDesc)(ctx, desc)
 }
@@ -207,7 +213,7 @@ pub unsafe extern "C" fn ffxFsr3UpscalerGetUpscaleRatioFromQualityMode(qm: u32) 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ffxFsr3UpscalerResourceIsNull(res: *const c_void) -> u32 {
+pub unsafe extern "C" fn ffxFsr3UpscalerResourceIsNull(res: FfxResource) -> u32 {
     (FN_TABLE.get().unwrap().ResourceIsNull)(res)
 }
 
