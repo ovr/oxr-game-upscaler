@@ -85,8 +85,50 @@ unsafe fn dispatch_upscale(desc: *const ffxDispatchDescHeader) -> ffxReturnCode_
         cmd_list.ResourceBarrier(&valid_before);
     }
 
-    // Passthrough: copy color → output.
-    cmd_list.CopyResource(&output_res, &color_res);
+    // Passthrough: copy render-region of color → top-left corner of output.
+    // CopyResource requires identical dimensions and silently fails when sizes differ
+    // (e.g. 1080p render target into a 4K output buffer).  Use CopyTextureRegion
+    // instead so only the rendered region is copied.
+    let src_w = if d.render_size.width > 0 {
+        d.render_size.width
+    } else {
+        d.color.description.width
+    };
+    let src_h = if d.render_size.height > 0 {
+        d.render_size.height
+    } else {
+        d.color.description.height
+    };
+
+    // Build copy locations without AddRef (transmute_copy borrows the pointer).
+    let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::ManuallyDrop::new(unsafe {
+            std::mem::transmute_copy(&color_res)
+        }),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::ManuallyDrop::new(unsafe {
+            std::mem::transmute_copy(&output_res)
+        }),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    let src_box = D3D12_BOX {
+        left: 0,
+        top: 0,
+        front: 0,
+        right: src_w,
+        bottom: src_h,
+        back: 1,
+    };
+
+    info!(
+        src = format_args!("{}x{}", src_w, src_h),
+        "ffxDispatch: CopyTextureRegion render→output"
+    );
+    cmd_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, Some(&src_box));
 
     // Transition back to original states.
     let barriers_after = [
