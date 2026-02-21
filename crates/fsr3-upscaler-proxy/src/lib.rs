@@ -136,18 +136,20 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
     desc: *const c_void,
 ) -> u32 {
     if !desc.is_null() {
-        // FfxFsr3UpscalerDispatchDescription layout:
-        //   offset 0:   commandList (*mut c_void, 8 bytes)
-        //   offset 8:   10 × FfxApiResource (each 48 bytes) = 480 bytes
-        //   offset 488: jitterOffset (FfxApiFloatCoords2D, 8 bytes)
-        //   offset 496: motionVectorScale (FfxApiFloatCoords2D, 8 bytes)
-        //   offset 504: renderSize (FfxApiDimensions2D = 2×u32)
-        //   offset 512: upscaleSize (FfxApiDimensions2D = 2×u32)
         let base = desc as *const u8;
-        let rw = *(base.add(504) as *const u32);
-        let rh = *(base.add(508) as *const u32);
-        let uw = *(base.add(512) as *const u32);
-        let uh = *(base.add(516) as *const u32);
+        // Old-SDK FfxFsr3UpscalerDispatchDescription layout (FfxResource = 176 bytes):
+        //   offset 0:    commandList (void*, 8 bytes)
+        //   offset 8:    10 × FfxResource (176 bytes each) = 1760 bytes
+        //   offset 1768: jitterOffset (2×f32)
+        //   offset 1776: motionVectorScale (2×f32)
+        //   offset 1784: renderSize (2×u32)
+        //   offset 1792: enableSharpening (bool, no upscaleSize field)
+        // Output resource (#9) starts at 8 + 9×176 = 1592;
+        //   description.width at 1592+16 = 1608, height at 1612 → upscale dimensions.
+        let rw = *(base.add(1784) as *const u32);
+        let rh = *(base.add(1788) as *const u32);
+        let uw = *(base.add(1608) as *const u32);
+        let uh = *(base.add(1612) as *const u32);
         info!(
             render = format_args!("{}x{}", rw, rh),
             upscale = format_args!("{}x{}", uw, uh),
