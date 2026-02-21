@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+mod dispatch;
 mod fsr3_types;
 mod logging;
 
@@ -150,19 +151,22 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
     ctx: *mut FfxFsr3UpscalerContext,
     desc: *const FfxFsr3UpscalerDispatchDescription,
 ) -> u32 {
-    if !desc.is_null() {
-        let d = &*desc;
-        let rw = d.render_size.width;
-        let rh = d.render_size.height;
-        let uw = d.output.description.width;
-        let uh = d.output.description.height;
-        info!(
-            render = format_args!("{}x{}", rw, rh),
-            upscale = format_args!("{}x{}", uw, uh),
-            "ffxFsr3UpscalerContextDispatch"
-        );
+    if desc.is_null() {
+        return (FN_TABLE.get().unwrap().ContextDispatch)(ctx, desc);
     }
-    (FN_TABLE.get().unwrap().ContextDispatch)(ctx, desc)
+
+    let d = &*desc;
+    let rw = d.render_size.width;
+    let rh = d.render_size.height;
+    let uw = d.output.description.width;
+    let uh = d.output.description.height;
+    info!(
+        render = format_args!("{}x{}", rw, rh),
+        upscale = format_args!("{}x{}", uw, uh),
+        "ffxFsr3UpscalerContextDispatch"
+    );
+
+    dispatch::dispatch_upscale(d)
 }
 
 #[no_mangle]
