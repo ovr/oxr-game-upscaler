@@ -1,5 +1,5 @@
 [package]
-name = "oxr-dll"
+name = "oxr-amd-fidelityfx-dx12"
 version = "0.1.0"
 edition = "2021"
 
