@@ -8,31 +8,15 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::fsr3_types::FfxSurfaceFormat;
 
-const VS_SOURCE: &[u8] = b"
-cbuffer Params : register(b0) { float2 uvScale; };
-struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
-VSOut VS(uint id : SV_VertexID) {
-    VSOut o;
-    float2 uv = float2((id << 1) & 2, id & 2);
-    o.pos = float4(uv * 2.0 - 1.0, 0, 1);
-    o.pos.y = -o.pos.y;
-    o.uv = uv * uvScale;
-    return o;
-}
-";
-
-const PS_SOURCE: &[u8] = b"
-Texture2D<float4> src : register(t0);
-SamplerState samp : register(s0);
-float4 PS(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
-    return src.Sample(samp, uv);
-}
-";
+const VS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_vs.hlsl");
+const PS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_ps.hlsl");
+const LANCZOS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/lanczos_ps.hlsl");
 
 pub struct GpuState {
     pub device: ID3D12Device,
     pub root_signature: ID3D12RootSignature,
-    pub pso: ID3D12PipelineState,
+    pub pso_bilinear: ID3D12PipelineState,
+    pub pso_lanczos: ID3D12PipelineState,
     pub srv_heap: ID3D12DescriptorHeap,
     pub rtv_heap: ID3D12DescriptorHeap,
 }
@@ -75,13 +59,29 @@ unsafe fn try_init(
 
     let vs_blob = compile_shader(VS_SOURCE, b"VS\0", b"vs_5_0\0")?;
     let ps_blob = compile_shader(PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
+    let lanczos_ps_blob = compile_shader(LANCZOS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     info!("gpu_pipeline: shaders compiled");
 
     let root_signature = create_root_signature(&device)?;
     info!("gpu_pipeline: root signature created");
 
-    let pso = create_pso(&device, &root_signature, &vs_blob, &ps_blob, typed_format)?;
-    info!("gpu_pipeline: PSO created (format={:?})", typed_format);
+    let pso_bilinear = create_pso(&device, &root_signature, &vs_blob, &ps_blob, typed_format)?;
+    info!(
+        "gpu_pipeline: PSO created (bilinear, format={:?})",
+        typed_format
+    );
+
+    let pso_lanczos = create_pso(
+        &device,
+        &root_signature,
+        &vs_blob,
+        &lanczos_ps_blob,
+        typed_format,
+    )?;
+    info!(
+        "gpu_pipeline: PSO created (lanczos, format={:?})",
+        typed_format
+    );
 
     let srv_heap =
         create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true)?;
@@ -91,7 +91,8 @@ unsafe fn try_init(
     Ok(GpuState {
         device,
         root_signature,
-        pso,
+        pso_bilinear,
+        pso_lanczos,
         srv_heap,
         rtv_heap,
     })
@@ -137,7 +138,7 @@ unsafe fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSigna
     let constants = D3D12_ROOT_CONSTANTS {
         ShaderRegister: 0,
         RegisterSpace: 0,
-        Num32BitValues: 2,
+        Num32BitValues: 4,
     };
 
     let srv_range = D3D12_DESCRIPTOR_RANGE {
@@ -154,7 +155,7 @@ unsafe fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSigna
             Anonymous: D3D12_ROOT_PARAMETER_0 {
                 Constants: constants,
             },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,

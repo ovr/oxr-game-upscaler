@@ -1,5 +1,6 @@
 use crate::fsr3_types::*;
 use crate::gpu_pipeline;
+use crate::upscaler_type::{self, UpscalerType};
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -122,13 +123,19 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     );
 
     // --- Set pipeline state ---
+    let pso = match upscaler_type::ACTIVE {
+        UpscalerType::Bilinear => &gpu.pso_bilinear,
+        UpscalerType::Lanczos => &gpu.pso_lanczos,
+    };
     cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
-    cmd_list.SetPipelineState(&gpu.pso);
+    cmd_list.SetPipelineState(pso);
     cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
 
-    // Root constants: uvScale (2 × f32)
+    // Root constants: uvScale (slots 0–1) + inputSize (slots 2–3)
     cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_x.to_bits(), 0);
     cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_y.to_bits(), 1);
+    cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_w as f32).to_bits(), 2);
+    cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_h as f32).to_bits(), 3);
 
     // Descriptor table: SRV
     cmd_list.SetGraphicsRootDescriptorTable(1, gpu.srv_heap.GetGPUDescriptorHandleForHeapStart());
@@ -163,7 +170,7 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
         render = format_args!("{}x{}", render_w, render_h),
         output = format_args!("{}x{}", output_w, output_h),
         uv_scale = format_args!("({:.3}, {:.3})", uv_scale_x, uv_scale_y),
-        "DrawInstanced bilinear blit"
+        "DrawInstanced upscale blit"
     );
 
     // --- Barriers: restore original states ---
