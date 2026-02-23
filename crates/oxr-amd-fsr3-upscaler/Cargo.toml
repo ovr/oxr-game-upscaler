@@ -1,5 +1,5 @@
 [package]
-name = "fsr3-upscaler-proxy"
+name = "oxr-amd-fsr3-upscaler"
 version = "0.1.0"
 edition = "2021"
 

@@ -46,16 +46,6 @@ name = "fsr-sys"
 version = "0.1.0"
 
 [[package]]
-name = "fsr3-upscaler-proxy"
-version = "0.1.0"
-dependencies = [
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "windows",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -114,6 +104,16 @@ name = "oxr-amd-fidelityfx-dx12"
 version = "0.1.0"
 dependencies = [
  "fsr-sys",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "windows",
+]
+
+[[package]]
+name = "oxr-amd-fsr3-upscaler"
+version = "0.1.0"
+dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

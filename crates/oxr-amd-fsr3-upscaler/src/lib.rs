@@ -54,7 +54,7 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut ()) -> bool
     match reason {
         DLL_PROCESS_ATTACH => {
             logging::init();
-            info!("fsr3-upscaler-proxy: loading original");
+            info!("oxr-amd-fsr3-upscaler: loading original");
             let wname: Vec<u16> = "ffx_fsr3upscaler_x64_original.dll\0"
                 .encode_utf16()
                 .collect();
@@ -121,11 +121,11 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut ()) -> bool
                     )),
                 })
                 .ok();
-            info!("fsr3-upscaler-proxy: ready");
+            info!("oxr-amd-fsr3-upscaler: ready");
             true
         }
         DLL_PROCESS_DETACH => {
-            info!("fsr3-upscaler-proxy: unloading");
+            info!("oxr-amd-fsr3-upscaler: unloading");
             true
         }
         _ => true,
