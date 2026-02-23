@@ -11,6 +11,7 @@ name = "ffx_fsr3upscaler_x64"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
+imgui = "0.12"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_SystemServices",
@@ -19,4 +20,6 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }

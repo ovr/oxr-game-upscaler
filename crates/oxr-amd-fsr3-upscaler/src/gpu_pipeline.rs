@@ -19,6 +19,28 @@ pub struct GpuState {
     pub pso_lanczos: ID3D12PipelineState,
     pub srv_heap: ID3D12DescriptorHeap,
     pub rtv_heap: ID3D12DescriptorHeap,
+    pub srv_descriptor_size: u32,
+    pub rt_format: DXGI_FORMAT,
+}
+
+pub fn get_rt_format(gpu: &GpuState) -> DXGI_FORMAT {
+    gpu.rt_format
+}
+
+/// Return the CPU descriptor handle for slot `slot` in the SRV heap.
+pub unsafe fn get_srv_cpu_handle(gpu: &GpuState, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    let base = gpu.srv_heap.GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: base.ptr + (slot * gpu.srv_descriptor_size) as usize,
+    }
+}
+
+/// Return the GPU descriptor handle for slot `slot` in the SRV heap.
+pub unsafe fn get_srv_gpu_handle(gpu: &GpuState, slot: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+    let base = gpu.srv_heap.GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: base.ptr + (slot * gpu.srv_descriptor_size) as u64,
+    }
 }
 
 // Stores Option<GpuState> so init failure doesn't poison the lock.
@@ -83,10 +105,14 @@ unsafe fn try_init(
         typed_format
     );
 
+    // Slot 0: blit color SRV, Slot 1: imgui font SRV, Slot 2: spare
     let srv_heap =
-        create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true)?;
+        create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, true)?;
     let rtv_heap = create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false)?;
     info!("gpu_pipeline: descriptor heaps created");
+
+    let srv_descriptor_size =
+        device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     Ok(GpuState {
         device,
@@ -95,6 +121,8 @@ unsafe fn try_init(
         pso_lanczos,
         srv_heap,
         rtv_heap,
+        srv_descriptor_size,
+        rt_format: typed_format,
     })
 }
 

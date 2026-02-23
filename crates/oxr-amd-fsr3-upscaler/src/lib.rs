@@ -2,7 +2,9 @@
 mod dispatch;
 mod fsr3_types;
 mod gpu_pipeline;
+mod imgui_renderer;
 mod logging;
+mod overlay;
 mod upscaler_type;
 
 use core::ffi::c_void;
@@ -55,7 +57,7 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut ()) -> bool
     match reason {
         DLL_PROCESS_ATTACH => {
             logging::init();
-            info!("upscaler: {:?}", upscaler_type::ACTIVE);
+            info!("upscaler: {:?}", upscaler_type::get());
             info!("oxr-amd-fsr3-upscaler: loading original");
             let wname: Vec<u16> = "ffx_fsr3upscaler_x64_original.dll\0"
                 .encode_utf16()

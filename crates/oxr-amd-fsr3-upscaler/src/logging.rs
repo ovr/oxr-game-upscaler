@@ -18,7 +18,6 @@ pub unsafe fn init() {
         let log_dir = dll_directory().unwrap_or_else(|| PathBuf::from("."));
         let file_appender = tracing_appender::rolling::never(&log_dir, "oxr_fsr3proxy.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
         tracing_subscriber::registry()
             .with(
                 fmt::layer()
@@ -27,8 +26,6 @@ pub unsafe fn init() {
                     .with_target(false),
             )
             .init();
-
-        // Leak the guard so the writer stays alive for the process lifetime.
         GUARD = Some(guard);
     });
 }

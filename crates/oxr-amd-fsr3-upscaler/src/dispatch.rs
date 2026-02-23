@@ -1,5 +1,6 @@
 use crate::fsr3_types::*;
 use crate::gpu_pipeline;
+use crate::overlay;
 use crate::upscaler_type::{self, UpscalerType};
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -123,7 +124,7 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     );
 
     // --- Set pipeline state ---
-    let pso = match upscaler_type::ACTIVE {
+    let pso = match upscaler_type::get() {
         UpscalerType::Bilinear => &gpu.pso_bilinear,
         UpscalerType::Lanczos => &gpu.pso_lanczos,
     };
@@ -172,6 +173,9 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
         uv_scale = format_args!("({:.3}, {:.3})", uv_scale_x, uv_scale_y),
         "DrawInstanced upscale blit"
     );
+
+    // --- Render imgui overlay (RTV still bound, output still in RENDER_TARGET state) ---
+    overlay::render_frame(&cmd_list, gpu, output_w, output_h);
 
     // --- Barriers: restore original states ---
     let barriers_after = [
