@@ -16,6 +16,8 @@ static mut GUARD: Option<WorkerGuard> = None;
 pub unsafe fn init() {
     INIT.call_once(|| {
         let log_dir = dll_directory().unwrap_or_else(|| PathBuf::from("."));
+        // Truncate previous log so each game session starts clean.
+        let _ = std::fs::File::create(log_dir.join("oxr_upscaler.log"));
         let file_appender = tracing_appender::rolling::never(&log_dir, "oxr_upscaler.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
