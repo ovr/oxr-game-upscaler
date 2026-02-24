@@ -171,7 +171,16 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
         "ffxFsr3UpscalerContextDispatch"
     );
 
-    dispatch::dispatch_upscale(d)
+    if rw == uw && rh == uh {
+        info!("AA mode (no upscale), CopyResource passthrough");
+        return dispatch::dispatch_anti_aliasing(d);
+    }
+
+    let start = std::time::Instant::now();
+    let result = dispatch::dispatch_upscale(d);
+    let elapsed = start.elapsed();
+    info!(elapsed_us = elapsed.as_micros(), "dispatch total");
+    result
 }
 
 #[no_mangle]

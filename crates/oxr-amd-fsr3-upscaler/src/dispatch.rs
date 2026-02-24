@@ -198,6 +198,85 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     0 // FFX_OK
 }
 
+/// Lightweight color → output copy for AA mode (render_size == output_size).
+/// No GPU pipeline, no shaders — just barrier + CopyResource + barrier.
+pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
+    let cmd_list_raw = d.command_list;
+    if cmd_list_raw.is_null() {
+        warn!("dispatch_aa_copy: null command list");
+        return 1;
+    }
+
+    let color_raw = d.color.resource;
+    let output_raw = d.output.resource;
+    if color_raw.is_null() || output_raw.is_null() {
+        warn!("dispatch_aa_copy: null color or output resource");
+        return 1;
+    }
+
+    let cmd_list: ID3D12GraphicsCommandList =
+        match <ID3D12GraphicsCommandList as windows::core::Interface>::from_raw_borrowed(
+            &cmd_list_raw,
+        ) {
+            Some(borrowed) => borrowed.clone(),
+            None => {
+                error!("dispatch_aa_copy: from_raw_borrowed failed for command list");
+                return 1;
+            }
+        };
+
+    let color_res: ID3D12Resource =
+        match <ID3D12Resource as windows::core::Interface>::from_raw_borrowed(&color_raw) {
+            Some(borrowed) => borrowed.clone(),
+            None => {
+                error!("dispatch_aa_copy: from_raw_borrowed failed for color resource");
+                return 1;
+            }
+        };
+
+    let output_res: ID3D12Resource =
+        match <ID3D12Resource as windows::core::Interface>::from_raw_borrowed(&output_raw) {
+            Some(borrowed) => borrowed.clone(),
+            None => {
+                error!("dispatch_aa_copy: from_raw_borrowed failed for output resource");
+                return 1;
+            }
+        };
+
+    // Barriers: color → COPY_SOURCE, output → COPY_DEST
+    let barriers_before = [
+        resource_barrier_transition(&color_res, d.color.state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        resource_barrier_transition(&output_res, d.output.state, D3D12_RESOURCE_STATE_COPY_DEST),
+    ];
+    let valid_before: Vec<_> = barriers_before.iter().flatten().cloned().collect();
+    if !valid_before.is_empty() {
+        cmd_list.ResourceBarrier(&valid_before);
+    }
+
+    // CopyResource — valid because sizes are identical in AA mode.
+    cmd_list.CopyResource(&output_res, &color_res);
+
+    // Barriers: restore original states
+    let barriers_after = [
+        resource_barrier_transition_d3d12(
+            &color_res,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ffx_state_to_d3d12(d.color.state),
+        ),
+        resource_barrier_transition_d3d12(
+            &output_res,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            ffx_state_to_d3d12(d.output.state),
+        ),
+    ];
+    let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
+    if !valid_after.is_empty() {
+        cmd_list.ResourceBarrier(&valid_after);
+    }
+
+    0 // FFX_OK
+}
+
 // Old SDK FfxResourceStates bit values (identical to FFX_API_RESOURCE_STATE_*):
 const FFX_RESOURCE_STATE_COMMON: u32 = 1 << 0;
 const FFX_RESOURCE_STATE_UNORDERED_ACCESS: u32 = 1 << 1;
