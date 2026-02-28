@@ -1,8 +1,7 @@
 /// In-game imgui overlay for runtime upscaler switching.
 ///
 /// **Home** — toggle overlay visible/hidden
-/// **End + Up/Down** — navigate focus between UI elements
-/// **End + Left/Right** — change value of focused element
+/// **End + Up/Down/Enter/Space** — navigate and activate widgets (imgui keyboard nav)
 use std::sync::Mutex;
 
 use imgui::{Condition, Context};
@@ -12,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 use crate::gpu_pipeline::{self, get_srv_cpu_handle, get_srv_gpu_handle, GpuState};
 use crate::imgui_renderer::ImguiDx12Renderer;
-use crate::upscaler_type;
+use crate::upscaler_type::{self, UpscalerType};
 
 const VK_HOME: i32 = 0x24;
 const VK_END: i32 = 0x23;
@@ -20,6 +19,8 @@ const VK_UP: i32 = 0x26;
 const VK_DOWN: i32 = 0x28;
 const VK_LEFT: i32 = 0x25;
 const VK_RIGHT: i32 = 0x27;
+const VK_RETURN: i32 = 0x0D;
+const VK_SPACE: i32 = 0x20;
 
 struct OverlayState {
     ctx: Context,
@@ -27,11 +28,6 @@ struct OverlayState {
     visible: bool,
     frame_idx: usize,
     prev_home: bool,
-    prev_up: bool,
-    prev_down: bool,
-    prev_left: bool,
-    prev_right: bool,
-    focus_index: usize,
     fonts_ready: bool,
 }
 
@@ -75,34 +71,13 @@ pub unsafe fn render_frame(
 
     let state = guard.as_mut().unwrap();
 
-    // --- Keyboard input (rising edge) ---
+    // --- Keyboard input (rising edge for Home toggle) ---
     let home = key_down(VK_HOME);
     if home && !state.prev_home {
         state.visible = !state.visible;
         info!("overlay: visible={}", state.visible);
     }
     state.prev_home = home;
-
-    // Manual key handling — all arrows with rising edge, End as modifier
-    let end = key_down(VK_END);
-
-    let up = end && key_down(VK_UP);
-    let down = end && key_down(VK_DOWN);
-    let left = end && key_down(VK_LEFT);
-    let right = end && key_down(VK_RIGHT);
-
-    let up_pressed = up && !state.prev_up;
-    let down_pressed = down && !state.prev_down;
-    let left_pressed = left && !state.prev_left;
-    let right_pressed = right && !state.prev_right;
-
-    const NUM_ITEMS: usize = 2;
-    if up_pressed && state.focus_index > 0 {
-        state.focus_index -= 1;
-    }
-    if down_pressed && state.focus_index < NUM_ITEMS - 1 {
-        state.focus_index += 1;
-    }
 
     if !state.visible {
         return;
@@ -122,11 +97,20 @@ pub unsafe fn render_frame(
         state.fonts_ready = true;
     }
 
-    // --- Feed imgui IO (no mouse — keyboard-only control) ---
+    // --- Feed imgui IO (keyboard nav via End modifier) ---
     {
         let io = state.ctx.io_mut();
         io.display_size = [output_w as f32, output_h as f32];
         io.delta_time = 1.0 / 60.0;
+
+        // Feed nav keys to imgui only while End is held (avoid stealing game input)
+        let end = key_down(VK_END);
+        io.add_key_event(imgui::Key::UpArrow, end && key_down(VK_UP));
+        io.add_key_event(imgui::Key::DownArrow, end && key_down(VK_DOWN));
+        io.add_key_event(imgui::Key::LeftArrow, end && key_down(VK_LEFT));
+        io.add_key_event(imgui::Key::RightArrow, end && key_down(VK_RIGHT));
+        io.add_key_event(imgui::Key::Enter, end && key_down(VK_RETURN));
+        io.add_key_event(imgui::Key::Space, end && key_down(VK_SPACE));
     }
 
     // --- Build UI ---
@@ -139,74 +123,37 @@ pub unsafe fn render_frame(
             ui.push_style_color(imgui::StyleColor::TitleBgActive, [0.3, 0.3, 0.3, 1.0]);
 
         ui.window("Upscaler")
-            .size([500.0, 200.0], Condition::Always)
+            .size([450.0, 0.0], Condition::Always)
             .position([60.0, 400.0], Condition::Always)
-            .no_inputs()
+            .flags(imgui::WindowFlags::NO_MOUSE_INPUTS)
             .build(|| {
-                let active = upscaler_type::get();
-                let focused = state.focus_index == 0;
-                let label = format!(
-                    "{}Upscaler  < {:?} >",
-                    if focused { ">> " } else { "   " },
-                    active
-                );
-
-                if focused {
-                    let tok = ui.push_style_color(imgui::StyleColor::Text, [1.0, 1.0, 0.0, 1.0]);
-                    ui.text(&label);
-                    tok.pop();
-                } else {
-                    ui.text(&label);
+                // Upscaler radio buttons
+                let mut active = upscaler_type::get();
+                ui.text("Upscaler");
+                if ui.radio_button("Bilinear", &mut active, UpscalerType::Bilinear) {
+                    upscaler_type::set(active);
+                    info!("overlay: switched to {:?}", active);
+                }
+                ui.same_line();
+                if ui.radio_button("Lanczos", &mut active, UpscalerType::Lanczos) {
+                    upscaler_type::set(active);
+                    info!("overlay: switched to {:?}", active);
                 }
 
-                if focused {
-                    if left_pressed {
-                        let new = active.prev();
-                        upscaler_type::set(new);
-                        info!("overlay: switched to {:?}", new);
-                    }
-                    if right_pressed {
-                        let new = active.next();
-                        upscaler_type::set(new);
-                        info!("overlay: switched to {:?}", new);
-                    }
-                }
+                ui.separator();
 
                 // Debug View checkbox
-                let dbg_focused = state.focus_index == 1;
-                let dbg_on = upscaler_type::debug_view_get();
-                let dbg_label = format!(
-                    "{}[{}] Debug View",
-                    if dbg_focused { ">> " } else { "   " },
-                    if dbg_on { "x" } else { " " }
-                );
-
-                if dbg_focused {
-                    let tok = ui.push_style_color(imgui::StyleColor::Text, [1.0, 1.0, 0.0, 1.0]);
-                    ui.text(&dbg_label);
-                    tok.pop();
-                } else {
-                    ui.text(&dbg_label);
+                let mut debug_on = upscaler_type::debug_view_get();
+                if ui.checkbox("Debug View", &mut debug_on) {
+                    upscaler_type::debug_view_set(debug_on);
+                    info!("overlay: debug_view={}", debug_on);
                 }
-
-                if dbg_focused && (left_pressed || right_pressed) {
-                    upscaler_type::debug_view_set(!dbg_on);
-                    info!("overlay: debug_view={}", !dbg_on);
-                }
-
-                ui.spacing();
-                ui.text("[Home] toggle  [End+Arrows] navigate & change");
             });
 
         title_active_tok.pop();
         title_tok.pop();
         bg_tok.pop();
     }
-
-    state.prev_up = up;
-    state.prev_down = down;
-    state.prev_left = left;
-    state.prev_right = right;
 
     let draw_data = state.ctx.render();
 
@@ -227,6 +174,7 @@ pub unsafe fn render_frame(
 unsafe fn init_overlay(gpu: &GpuState) -> Result<OverlayState, String> {
     let mut ctx = Context::create();
     ctx.set_ini_filename(None);
+    ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
 
     ctx.fonts().add_font(&[imgui::FontSource::DefaultFontData {
         config: Some(imgui::FontConfig {
@@ -245,11 +193,6 @@ unsafe fn init_overlay(gpu: &GpuState) -> Result<OverlayState, String> {
         visible: true,
         frame_idx: 0,
         prev_home: false,
-        prev_up: false,
-        prev_down: false,
-        prev_left: false,
-        prev_right: false,
-        focus_index: 0,
         fonts_ready: false,
     })
 }

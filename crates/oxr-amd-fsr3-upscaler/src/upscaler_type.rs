@@ -19,21 +19,6 @@ pub fn set(t: UpscalerType) {
     ACTIVE.store(t as u8, Ordering::Relaxed);
 }
 
-impl UpscalerType {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Bilinear => Self::Lanczos,
-            Self::Lanczos => Self::Bilinear,
-        }
-    }
-    pub fn prev(self) -> Self {
-        match self {
-            Self::Bilinear => Self::Lanczos,
-            Self::Lanczos => Self::Bilinear,
-        }
-    }
-}
-
 static DEBUG_VIEW: AtomicBool = AtomicBool::new(false);
 
 pub fn debug_view_get() -> bool {
