@@ -1,8 +1,8 @@
 /// In-game imgui overlay for runtime upscaler switching.
 ///
 /// **Home** — toggle overlay visible/hidden
-/// **1** — select Bilinear
-/// **2** — select Lanczos
+/// **End + Up/Down** — navigate focus between UI elements
+/// **End + Left/Right** — change value of focused element
 use std::sync::Mutex;
 
 use imgui::{Condition, Context};
@@ -12,13 +12,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 use crate::gpu_pipeline::{self, get_srv_cpu_handle, get_srv_gpu_handle, GpuState};
 use crate::imgui_renderer::ImguiDx12Renderer;
-use crate::upscaler_type::{self, UpscalerType};
+use crate::upscaler_type;
 
 const VK_HOME: i32 = 0x24;
 const VK_END: i32 = 0x23;
-const VK_1: i32 = 0x31;
-const VK_2: i32 = 0x32;
-const VK_3: i32 = 0x33;
+const VK_UP: i32 = 0x26;
+const VK_DOWN: i32 = 0x28;
+const VK_LEFT: i32 = 0x25;
+const VK_RIGHT: i32 = 0x27;
 
 struct OverlayState {
     ctx: Context,
@@ -26,9 +27,11 @@ struct OverlayState {
     visible: bool,
     frame_idx: usize,
     prev_home: bool,
-    prev_1: bool,
-    prev_2: bool,
-    prev_3: bool,
+    prev_up: bool,
+    prev_down: bool,
+    prev_left: bool,
+    prev_right: bool,
+    focus_index: usize,
     fonts_ready: bool,
 }
 
@@ -80,28 +83,26 @@ pub unsafe fn render_frame(
     }
     state.prev_home = home;
 
-    // End+1 = Bilinear, End+2 = Lanczos
+    // Manual key handling — all arrows with rising edge, End as modifier
     let end = key_down(VK_END);
-    let k1 = key_down(VK_1);
-    let k2 = key_down(VK_2);
-    let k3 = key_down(VK_3);
 
-    if end && k1 && !state.prev_1 {
-        upscaler_type::set(UpscalerType::Bilinear);
-        info!("overlay: switched to Bilinear (End+1)");
-    }
-    if end && k2 && !state.prev_2 {
-        upscaler_type::set(UpscalerType::Lanczos);
-        info!("overlay: switched to Lanczos (End+2)");
-    }
-    if end && k3 && !state.prev_3 {
-        upscaler_type::set(UpscalerType::DebugView);
-        info!("overlay: switched to DebugView (End+3)");
-    }
+    let up = end && key_down(VK_UP);
+    let down = end && key_down(VK_DOWN);
+    let left = end && key_down(VK_LEFT);
+    let right = end && key_down(VK_RIGHT);
 
-    state.prev_1 = k1;
-    state.prev_2 = k2;
-    state.prev_3 = k3;
+    let up_pressed = up && !state.prev_up;
+    let down_pressed = down && !state.prev_down;
+    let left_pressed = left && !state.prev_left;
+    let right_pressed = right && !state.prev_right;
+
+    const NUM_ITEMS: usize = 1; // only upscaler for now
+    if up_pressed && state.focus_index > 0 {
+        state.focus_index -= 1;
+    }
+    if down_pressed && state.focus_index < NUM_ITEMS - 1 {
+        state.focus_index += 1;
+    }
 
     if !state.visible {
         return;
@@ -143,23 +144,47 @@ pub unsafe fn render_frame(
             .no_inputs()
             .build(|| {
                 let active = upscaler_type::get();
-                let sel = |t: UpscalerType| if active == t { ">>>" } else { "   " };
+                let focused = state.focus_index == 0;
+                let label = format!(
+                    "{}Upscaler  < {:?} >",
+                    if focused { ">> " } else { "   " },
+                    active
+                );
 
-                ui.text(format!("{} [End+1] Bilinear", sel(UpscalerType::Bilinear)));
-                ui.text(format!("{} [End+2] Lanczos", sel(UpscalerType::Lanczos)));
-                ui.text(format!(
-                    "{} [End+3] Debug View",
-                    sel(UpscalerType::DebugView)
-                ));
+                if focused {
+                    let tok = ui.push_style_color(imgui::StyleColor::Text, [1.0, 1.0, 0.0, 1.0]);
+                    ui.text(&label);
+                    tok.pop();
+                } else {
+                    ui.text(&label);
+                }
+
+                if focused {
+                    if left_pressed {
+                        let new = active.prev();
+                        upscaler_type::set(new);
+                        info!("overlay: switched to {:?}", new);
+                    }
+                    if right_pressed {
+                        let new = active.next();
+                        upscaler_type::set(new);
+                        info!("overlay: switched to {:?}", new);
+                    }
+                }
+
                 ui.spacing();
-                ui.text(format!("Active: {:?}", active));
-                ui.text("[Home] toggle overlay");
+                ui.text("[Home] toggle  [End+Arrows] navigate & change");
             });
 
         title_active_tok.pop();
         title_tok.pop();
         bg_tok.pop();
     }
+
+    state.prev_up = up;
+    state.prev_down = down;
+    state.prev_left = left;
+    state.prev_right = right;
 
     let draw_data = state.ctx.render();
 
@@ -198,9 +223,11 @@ unsafe fn init_overlay(gpu: &GpuState) -> Result<OverlayState, String> {
         visible: true,
         frame_idx: 0,
         prev_home: false,
-        prev_1: false,
-        prev_2: false,
-        prev_3: false,
+        prev_up: false,
+        prev_down: false,
+        prev_left: false,
+        prev_right: false,
+        focus_index: 0,
         fonts_ready: false,
     })
 }
