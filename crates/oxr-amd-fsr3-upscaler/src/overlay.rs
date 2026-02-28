@@ -18,6 +18,7 @@ const VK_HOME: i32 = 0x24;
 const VK_END: i32 = 0x23;
 const VK_1: i32 = 0x31;
 const VK_2: i32 = 0x32;
+const VK_3: i32 = 0x33;
 
 struct OverlayState {
     ctx: Context,
@@ -27,6 +28,7 @@ struct OverlayState {
     prev_home: bool,
     prev_1: bool,
     prev_2: bool,
+    prev_3: bool,
     fonts_ready: bool,
 }
 
@@ -82,6 +84,7 @@ pub unsafe fn render_frame(
     let end = key_down(VK_END);
     let k1 = key_down(VK_1);
     let k2 = key_down(VK_2);
+    let k3 = key_down(VK_3);
 
     if end && k1 && !state.prev_1 {
         upscaler_type::set(UpscalerType::Bilinear);
@@ -91,9 +94,14 @@ pub unsafe fn render_frame(
         upscaler_type::set(UpscalerType::Lanczos);
         info!("overlay: switched to Lanczos (End+2)");
     }
+    if end && k3 && !state.prev_3 {
+        upscaler_type::set(UpscalerType::DebugView);
+        info!("overlay: switched to DebugView (End+3)");
+    }
 
     state.prev_1 = k1;
     state.prev_2 = k2;
+    state.prev_3 = k3;
 
     if !state.visible {
         return;
@@ -139,6 +147,10 @@ pub unsafe fn render_frame(
 
                 ui.text(format!("{} [End+1] Bilinear", sel(UpscalerType::Bilinear)));
                 ui.text(format!("{} [End+2] Lanczos", sel(UpscalerType::Lanczos)));
+                ui.text(format!(
+                    "{} [End+3] Debug View",
+                    sel(UpscalerType::DebugView)
+                ));
                 ui.spacing();
                 ui.text(format!("Active: {:?}", active));
                 ui.text("[Home] toggle overlay");
@@ -159,6 +171,7 @@ pub unsafe fn render_frame(
         .render(draw_data, cmd_list, frame_idx, &gpu.srv_heap, rtv_handle)
     {
         error!("overlay: render failed: {}", e);
+        gpu_pipeline::log_device_removed_reason(&gpu.device);
     }
 
     state.frame_idx = (state.frame_idx + 1) % 2;
@@ -187,6 +200,7 @@ unsafe fn init_overlay(gpu: &GpuState) -> Result<OverlayState, String> {
         prev_home: false,
         prev_1: false,
         prev_2: false,
+        prev_3: false,
         fonts_ready: false,
     })
 }

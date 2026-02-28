@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use windows::core::PCSTR;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -11,12 +11,14 @@ use crate::fsr3_types::FfxSurfaceFormat;
 const VS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_vs.hlsl");
 const PS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_ps.hlsl");
 const LANCZOS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/lanczos_ps.hlsl");
+const DEBUG_PS_SOURCE: &[u8] = include_bytes!("alg-scale/debug_ps.hlsl");
 
 pub struct GpuState {
     pub device: ID3D12Device,
     pub root_signature: ID3D12RootSignature,
     pub pso_bilinear: ID3D12PipelineState,
     pub pso_lanczos: ID3D12PipelineState,
+    pub pso_debug: ID3D12PipelineState,
     pub srv_heap: ID3D12DescriptorHeap,
     pub rtv_heap: ID3D12DescriptorHeap,
     pub srv_descriptor_size: u32,
@@ -82,6 +84,7 @@ unsafe fn try_init(
     let vs_blob = compile_shader(VS_SOURCE, b"VS\0", b"vs_5_0\0")?;
     let ps_blob = compile_shader(PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     let lanczos_ps_blob = compile_shader(LANCZOS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
+    let debug_ps_blob = compile_shader(DEBUG_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     info!("gpu_pipeline: shaders compiled");
 
     let root_signature = create_root_signature(&device)?;
@@ -105,9 +108,21 @@ unsafe fn try_init(
         typed_format
     );
 
-    // Slot 0: blit color SRV, Slot 1: imgui font SRV, Slot 2: spare
+    let pso_debug = create_pso(
+        &device,
+        &root_signature,
+        &vs_blob,
+        &debug_ps_blob,
+        typed_format,
+    )?;
+    info!(
+        "gpu_pipeline: PSO created (debug, format={:?})",
+        typed_format
+    );
+
+    // Slot 0: blit color SRV, Slot 1: imgui font SRV, Slots 2-8: debug textures, Slot 9: spare
     let srv_heap =
-        create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, true)?;
+        create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 10, true)?;
     let rtv_heap = create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false)?;
     info!("gpu_pipeline: descriptor heaps created");
 
@@ -119,6 +134,7 @@ unsafe fn try_init(
         root_signature,
         pso_bilinear,
         pso_lanczos,
+        pso_debug,
         srv_heap,
         rtv_heap,
         srv_descriptor_size,
@@ -363,8 +379,10 @@ unsafe fn create_descriptor_heap(
 
 /// Convert typeless DXGI formats to their most common typed equivalent.
 /// D3D12 PSOs require typed formats in RTVFormats[].
-fn dxgi_typeless_to_typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
+/// Also needed for SRV creation on typeless resources (e.g. depth buffers).
+pub fn dxgi_typeless_to_typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
     match format {
+        // Typeless → typed
         DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
         DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
         DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -376,7 +394,51 @@ fn dxgi_typeless_to_typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
         DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
         DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
         DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R24G8_TYPELESS => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        DXGI_FORMAT_R32G8X24_TYPELESS => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        // Depth/stencil → SRV-compatible typed format
+        DXGI_FORMAT_D32_FLOAT => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_D16_UNORM => DXGI_FORMAT_R16_UNORM,
+        DXGI_FORMAT_D24_UNORM_S8_UINT => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        other => {
+            if other == DXGI_FORMAT_UNKNOWN {
+                warn!("dxgi_typeless_to_typed: UNKNOWN format passed through");
+            }
+            other
+        }
+    }
+}
+
+/// Convert integer (UINT/SINT) DXGI formats to filterable equivalents (UNORM/FLOAT).
+/// D3D12 forbids linear filtering on integer formats — using them with a linear sampler
+/// poisons the GPU command stream and triggers TDR.
+pub fn dxgi_to_filterable(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT => DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT => DXGI_FORMAT_R16_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT => DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT => DXGI_FORMAT_R16G16_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => {
+            DXGI_FORMAT_R32G32B32A32_FLOAT
+        }
         other => other,
+    }
+}
+
+/// Check device status and log the removed reason if the device is lost.
+/// Call after GPU operations that may trigger TDR to get actionable error codes.
+pub unsafe fn log_device_removed_reason(device: &ID3D12Device) {
+    let hr = device.GetDeviceRemovedReason();
+    if let Err(e) = hr {
+        error!(
+            "Device removed reason: {} (0x{:08X})",
+            e.message(),
+            e.code().0 as u32
+        );
     }
 }
 
