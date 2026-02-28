@@ -1,7 +1,7 @@
 use crate::fsr3_types::*;
 use crate::gpu_pipeline::{self, GpuState};
 use crate::overlay;
-use crate::upscaler_type::{self, UpscalerType};
+use crate::upscaler_type;
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -183,8 +183,8 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
 
     // --- Set pipeline state ---
     let pso = match upscaler_type::get() {
-        UpscalerType::Bilinear => &gpu.pso_bilinear,
-        UpscalerType::Lanczos | UpscalerType::DebugView => &gpu.pso_lanczos,
+        upscaler_type::UpscalerType::Bilinear => &gpu.pso_bilinear,
+        upscaler_type::UpscalerType::Lanczos => &gpu.pso_lanczos,
     };
     cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
     cmd_list.SetPipelineState(pso);
@@ -233,7 +233,29 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
         "DrawInstanced upscale blit"
     );
 
+    // --- Debug view overlay (draws debug tiles on top of the upscaled image) ---
+    if upscaler_type::debug_view_get() {
+        draw_debug_tiles(&cmd_list, gpu, d, output_w, output_h);
+    }
+
     // --- Render imgui overlay (RTV still bound, output still in RENDER_TARGET state) ---
+    // Reset viewport/scissor to full output in case debug tiles changed them.
+    let full_viewport = D3D12_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: output_w as f32,
+        Height: output_h as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    let full_scissor = windows::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: output_w as i32,
+        bottom: output_h as i32,
+    };
+    cmd_list.RSSetViewports(&[full_viewport]);
+    cmd_list.RSSetScissorRects(&[full_scissor]);
     overlay::render_frame(&cmd_list, gpu, output_w, output_h);
 
     // --- Barriers: restore original states ---
@@ -257,60 +279,19 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     0 // FFX_OK
 }
 
-/// Debug view dispatch: renders a 3×1×3 grid showing internal FSR3 textures.
-/// Layout: left column (3 tiles) | center (upscaled color) | right column (3 tiles)
-/// Each side column is 1/5 output width; center is 3/5 output width.
-pub unsafe fn dispatch_debug_view(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
-    let cmd_list_raw = d.command_list;
-    if cmd_list_raw.is_null() {
-        warn!("dispatch_debug_view: null command list");
-        return 1;
-    }
-
-    let output_raw = d.output.resource;
-    if output_raw.is_null() {
-        warn!("dispatch_debug_view: null output resource");
-        return 1;
-    }
-
-    let cmd_list: ID3D12GraphicsCommandList =
-        match <ID3D12GraphicsCommandList as windows::core::Interface>::from_raw_borrowed(
-            &cmd_list_raw,
-        ) {
-            Some(borrowed) => borrowed.clone(),
-            None => {
-                error!("dispatch_debug_view: from_raw_borrowed failed for command list");
-                return 1;
-            }
-        };
-
-    let output_res: ID3D12Resource =
-        match <ID3D12Resource as windows::core::Interface>::from_raw_borrowed(&output_raw) {
-            Some(borrowed) => borrowed.clone(),
-            None => {
-                error!("dispatch_debug_view: from_raw_borrowed failed for output resource");
-                return 1;
-            }
-        };
-
-    let output_format = gpu_pipeline::ffx_format_to_dxgi(d.output.description.format);
-    let gpu = match gpu_pipeline::get_or_init(&cmd_list, output_format) {
-        Some(g) => g,
-        None => {
-            error!("dispatch_debug_view: GPU pipeline init failed");
-            return 1;
-        }
-    };
-
-    let output_w = d.output.description.width;
-    let output_h = d.output.description.height;
-    if output_w == 0 || output_h == 0 {
-        error!("dispatch_debug_view: zero output dimensions");
-        return 1;
-    }
-
-    // Collect all input resources we want to visualize, with their FFX states and viz modes.
-    // (resource_ptr, ffx_state, viz_mode, srv_slot)
+/// Draw 6 debug tiles (FSR3 internal textures) on top of the current render target.
+/// Layout: left column (3 tiles) | center (untouched) | right column (3 tiles).
+/// Each side column is 1/5 output width.
+///
+/// Assumes: output is already in RENDER_TARGET state with RTV bound, pipeline state
+/// (root signature, descriptor heaps, topology) is already set on `cmd_list`.
+unsafe fn draw_debug_tiles(
+    cmd_list: &ID3D12GraphicsCommandList,
+    gpu: &GpuState,
+    d: &FfxFsr3UpscalerDispatchDescription,
+    output_w: u32,
+    output_h: u32,
+) {
     struct DebugTile {
         resource_ptr: *mut core::ffi::c_void,
         ffx_state: u32,
@@ -319,9 +300,9 @@ pub unsafe fn dispatch_debug_view(d: &FfxFsr3UpscalerDispatchDescription) -> u32
         srv_slot: u32,
     }
 
-    // Left column (top to bottom): motion_vectors, transparency_and_composition, dilated_depth
-    // Right column (top to bottom): reconstructed_prev_nearest_depth, reactive, depth
-    let left_tiles = [
+    // Left column: motion_vectors, transparency_and_composition, dilated_depth
+    // Right column: reconstructed_prev_nearest_depth, reactive, depth
+    let tiles = [
         DebugTile {
             resource_ptr: d.motion_vectors.resource,
             ffx_state: d.motion_vectors.state,
@@ -343,8 +324,6 @@ pub unsafe fn dispatch_debug_view(d: &FfxFsr3UpscalerDispatchDescription) -> u32
             viz_mode: 1,
             srv_slot: 4,
         },
-    ];
-    let right_tiles = [
         DebugTile {
             resource_ptr: d.reconstructed_prev_nearest_depth.resource,
             ffx_state: d.reconstructed_prev_nearest_depth.state,
@@ -368,23 +347,11 @@ pub unsafe fn dispatch_debug_view(d: &FfxFsr3UpscalerDispatchDescription) -> u32
         },
     ];
 
-    // --- Barrier all input resources → PIXEL_SHADER_RESOURCE, output → RENDER_TARGET ---
-    let color_res = borrow_resource(d.color.resource);
+    // Borrow COM resources and barrier them to PIXEL_SHADER_RESOURCE.
+    let mut tile_resources: Vec<Option<ID3D12Resource>> = Vec::new();
     let mut barriers_before = Vec::new();
 
-    if let Some(r) = &color_res {
-        if let Some(b) = resource_barrier_transition(
-            r,
-            d.color.state,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers_before.push(b);
-        }
-    }
-
-    // Barrier debug tile resources
-    let mut tile_resources: Vec<Option<ID3D12Resource>> = Vec::new();
-    for tile in left_tiles.iter().chain(right_tiles.iter()) {
+    for tile in &tiles {
         let res = borrow_resource(tile.resource_ptr);
         if let Some(r) = &res {
             if let Some(b) = resource_barrier_transition(
@@ -398,114 +365,37 @@ pub unsafe fn dispatch_debug_view(d: &FfxFsr3UpscalerDispatchDescription) -> u32
         tile_resources.push(res);
     }
 
-    if let Some(b) = resource_barrier_transition(
-        &output_res,
-        d.output.state,
-        D3D12_RESOURCE_STATE_RENDER_TARGET,
-    ) {
-        barriers_before.push(b);
-    }
-
     if !barriers_before.is_empty() {
         cmd_list.ResourceBarrier(&barriers_before);
     }
 
-    // --- Create RTV for output ---
-    gpu.device.CreateRenderTargetView(
-        &output_res,
-        None,
-        gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart(),
-    );
+    // Grid layout
+    let side_w = output_w / 5;
+    let tile_h = output_h / 3;
+    let center_w = output_w - 2 * side_w;
 
-    let rtv_handle = gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart();
-    cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
-
-    // --- Clear output to black ---
-    cmd_list.ClearRenderTargetView(rtv_handle, &[0.0_f32, 0.0, 0.0, 1.0], None);
-
-    // --- Set shared pipeline state ---
+    // Re-bind shared pipeline state for debug PSO.
     cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
     cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
     cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    // Grid layout: side_w = output_w / 5, center_w = output_w * 3 / 5
-    let side_w = output_w / 5;
-    let tile_h = output_h / 3;
-    let center_x = side_w;
-    let center_w = output_w - 2 * side_w;
-
-    // --- Draw center tile (upscaled color) ---
-    if let Some(color_r) = &color_res {
-        let render_w = if d.render_size.width > 0 {
-            d.render_size.width
-        } else {
-            d.color.description.width
-        };
-        let render_h = if d.render_size.height > 0 {
-            d.render_size.height
-        } else {
-            d.color.description.height
-        };
-        let color_tex_w = d.color.description.width;
-        let color_tex_h = d.color.description.height;
-        let uv_scale_x = render_w as f32 / color_tex_w as f32;
-        let uv_scale_y = render_h as f32 / color_tex_h as f32;
-
-        create_typed_srv(gpu, color_r, d.color.description.format, 0);
-
-        cmd_list.SetPipelineState(&gpu.pso_bilinear);
-        cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_x.to_bits(), 0);
-        cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_y.to_bits(), 1);
-        cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_w as f32).to_bits(), 2);
-        cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_h as f32).to_bits(), 3);
-        cmd_list.SetGraphicsRootDescriptorTable(1, gpu_pipeline::get_srv_gpu_handle(gpu, 0));
-
-        let viewport = D3D12_VIEWPORT {
-            TopLeftX: center_x as f32,
-            TopLeftY: 0.0,
-            Width: center_w as f32,
-            Height: output_h as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        let scissor = windows::Win32::Foundation::RECT {
-            left: center_x as i32,
-            top: 0,
-            right: (center_x + center_w) as i32,
-            bottom: output_h as i32,
-        };
-        cmd_list.RSSetViewports(&[viewport]);
-        cmd_list.RSSetScissorRects(&[scissor]);
-        cmd_list.DrawInstanced(3, 1, 0, 0);
-        gpu_pipeline::log_device_removed_reason(&gpu.device);
-    }
-
-    // --- Draw debug tiles ---
-    let all_tiles: Vec<_> = left_tiles.iter().chain(right_tiles.iter()).collect();
-
-    for (i, tile) in all_tiles.iter().enumerate() {
-        let res = &tile_resources[i];
-        let res = match res {
+    for (i, tile) in tiles.iter().enumerate() {
+        let res = match &tile_resources[i] {
             Some(r) => r,
-            None => continue, // null resource, leave black
+            None => continue,
         };
 
-        // Determine tile position
         let (tile_x, tile_y) = if i < 3 {
-            // Left column
             (0u32, (i as u32) * tile_h)
         } else {
-            // Right column
-            (center_x + center_w, ((i - 3) as u32) * tile_h)
+            (side_w + center_w, ((i - 3) as u32) * tile_h)
         };
 
-        // Create SRV at the tile's slot (explicit typed format for typeless resources)
         if !create_typed_srv(gpu, res, tile.ffx_format, tile.srv_slot) {
-            continue; // skip tile — invalid format would poison GPU command stream
+            continue;
         }
 
         cmd_list.SetPipelineState(&gpu.pso_debug);
-        // uvScale = 1.0, 1.0 for debug tiles (show full texture)
         cmd_list.SetGraphicsRoot32BitConstant(0, 1.0_f32.to_bits(), 0);
         cmd_list.SetGraphicsRoot32BitConstant(0, 1.0_f32.to_bits(), 1);
         cmd_list.SetGraphicsRoot32BitConstant(0, tile.viz_mode, 2);
@@ -535,54 +425,18 @@ pub unsafe fn dispatch_debug_view(d: &FfxFsr3UpscalerDispatchDescription) -> u32
         gpu_pipeline::log_device_removed_reason(&gpu.device);
     }
 
-    info!(
-        output = format_args!("{}x{}", output_w, output_h),
-        "dispatch_debug_view rendered"
-    );
-
-    // --- Render imgui overlay ---
-    // Reset viewport to full output for overlay
-    let full_viewport = D3D12_VIEWPORT {
-        TopLeftX: 0.0,
-        TopLeftY: 0.0,
-        Width: output_w as f32,
-        Height: output_h as f32,
-        MinDepth: 0.0,
-        MaxDepth: 1.0,
-    };
-    let full_scissor = windows::Win32::Foundation::RECT {
-        left: 0,
-        top: 0,
-        right: output_w as i32,
-        bottom: output_h as i32,
-    };
-    cmd_list.RSSetViewports(&[full_viewport]);
-    cmd_list.RSSetScissorRects(&[full_scissor]);
-    overlay::render_frame(&cmd_list, gpu, output_w, output_h);
-
-    // --- Restore barriers ---
-    let mut barriers_after = Vec::new();
-
-    if let Some(r) = &color_res {
-        if let Some(b) = resource_barrier_transition_d3d12(
-            r,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            ffx_state_to_d3d12(d.color.state),
-        ) {
-            barriers_after.push(b);
-        }
-    }
-
-    let all_ffx_tiles_data = [
-        (d.motion_vectors.state, 0usize),
-        (d.transparency_and_composition.state, 1),
-        (d.dilated_depth.state, 2),
-        (d.reconstructed_prev_nearest_depth.state, 3),
-        (d.reactive.state, 4),
-        (d.depth.state, 5),
+    // Restore tile resource barriers to their original FFX states.
+    let tile_ffx_states = [
+        d.motion_vectors.state,
+        d.transparency_and_composition.state,
+        d.dilated_depth.state,
+        d.reconstructed_prev_nearest_depth.state,
+        d.reactive.state,
+        d.depth.state,
     ];
-    for (ffx_state, idx) in &all_ffx_tiles_data {
-        if let Some(r) = &tile_resources[*idx] {
+    let mut barriers_after = Vec::new();
+    for (idx, ffx_state) in tile_ffx_states.iter().enumerate() {
+        if let Some(r) = &tile_resources[idx] {
             if let Some(b) = resource_barrier_transition_d3d12(
                 r,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -592,20 +446,11 @@ pub unsafe fn dispatch_debug_view(d: &FfxFsr3UpscalerDispatchDescription) -> u32
             }
         }
     }
-
-    if let Some(b) = resource_barrier_transition_d3d12(
-        &output_res,
-        D3D12_RESOURCE_STATE_RENDER_TARGET,
-        ffx_state_to_d3d12(d.output.state),
-    ) {
-        barriers_after.push(b);
-    }
-
     if !barriers_after.is_empty() {
         cmd_list.ResourceBarrier(&barriers_after);
     }
 
-    0 // FFX_OK
+    info!("debug tiles rendered");
 }
 
 /// Borrow a COM resource from a raw FFX pointer, returning None if null.

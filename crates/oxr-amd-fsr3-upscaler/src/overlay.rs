@@ -96,7 +96,7 @@ pub unsafe fn render_frame(
     let left_pressed = left && !state.prev_left;
     let right_pressed = right && !state.prev_right;
 
-    const NUM_ITEMS: usize = 1; // only upscaler for now
+    const NUM_ITEMS: usize = 2;
     if up_pressed && state.focus_index > 0 {
         state.focus_index -= 1;
     }
@@ -170,6 +170,28 @@ pub unsafe fn render_frame(
                         upscaler_type::set(new);
                         info!("overlay: switched to {:?}", new);
                     }
+                }
+
+                // Debug View checkbox
+                let dbg_focused = state.focus_index == 1;
+                let dbg_on = upscaler_type::debug_view_get();
+                let dbg_label = format!(
+                    "{}[{}] Debug View",
+                    if dbg_focused { ">> " } else { "   " },
+                    if dbg_on { "x" } else { " " }
+                );
+
+                if dbg_focused {
+                    let tok = ui.push_style_color(imgui::StyleColor::Text, [1.0, 1.0, 0.0, 1.0]);
+                    ui.text(&dbg_label);
+                    tok.pop();
+                } else {
+                    ui.text(&dbg_label);
+                }
+
+                if dbg_focused && (left_pressed || right_pressed) {
+                    upscaler_type::debug_view_set(!dbg_on);
+                    info!("overlay: debug_view={}", !dbg_on);
                 }
 
                 ui.spacing();

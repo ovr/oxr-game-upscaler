@@ -11,7 +11,6 @@ use core::ffi::c_void;
 use fsr3_types::*;
 use std::sync::OnceLock;
 use tracing::info;
-use upscaler_type::UpscalerType;
 use windows::core::PCSTR;
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -171,18 +170,6 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
         upscale = format_args!("{}x{}", uw, uh),
         "ffxFsr3UpscalerContextDispatch"
     );
-
-    // Debug view overrides all other modes (works regardless of resolution match).
-    if upscaler_type::get() == UpscalerType::DebugView {
-        let start = std::time::Instant::now();
-        let result = dispatch::dispatch_debug_view(d);
-        let elapsed = start.elapsed();
-        info!(
-            elapsed_us = elapsed.as_micros(),
-            "dispatch debug_view total"
-        );
-        return result;
-    }
 
     if rw == uw && rh == uh {
         info!("AA mode (no upscale), CopyResource passthrough");
