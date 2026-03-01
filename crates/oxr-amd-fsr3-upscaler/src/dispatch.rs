@@ -461,8 +461,8 @@ unsafe fn borrow_resource(raw: *mut core::ffi::c_void) -> Option<ID3D12Resource>
     <ID3D12Resource as windows::core::Interface>::from_raw_borrowed(&raw).map(|b| b.clone())
 }
 
-/// Lightweight color → output copy for AA mode (render_size == output_size).
-/// No GPU pipeline, no shaders — just barrier + CopyResource + barrier.
+/// Color → output copy for AA mode (render_size == output_size) with overlay support.
+/// Copies via CopyResource, then renders the imgui overlay on top.
 pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     let cmd_list_raw = d.command_list;
     if cmd_list_raw.is_null() {
@@ -506,6 +506,9 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
             }
         };
 
+    let output_w = d.output.description.width;
+    let output_h = d.output.description.height;
+
     // Barriers: color → COPY_SOURCE, output → COPY_DEST
     let barriers_before = [
         resource_barrier_transition(&color_res, d.color.state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -519,22 +522,89 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
     // CopyResource — valid because sizes are identical in AA mode.
     cmd_list.CopyResource(&output_res, &color_res);
 
-    // Barriers: restore original states
-    let barriers_after = [
-        resource_barrier_transition_d3d12(
-            &color_res,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            ffx_state_to_d3d12(d.color.state),
-        ),
-        resource_barrier_transition_d3d12(
+    // Try to init GPU pipeline for overlay rendering.
+    let output_format = gpu_pipeline::ffx_format_to_dxgi(d.output.description.format);
+    let gpu = gpu_pipeline::get_or_init(&cmd_list, output_format);
+
+    if let Some(gpu) = gpu {
+        // Transition: color COPY_SOURCE → original, output COPY_DEST → RENDER_TARGET
+        let barriers_mid = [
+            resource_barrier_transition_d3d12(
+                &color_res,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ffx_state_to_d3d12(d.color.state),
+            ),
+            resource_barrier_transition_d3d12(
+                &output_res,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ),
+        ];
+        let valid_mid: Vec<_> = barriers_mid.iter().flatten().cloned().collect();
+        if !valid_mid.is_empty() {
+            cmd_list.ResourceBarrier(&valid_mid);
+        }
+
+        // Create RTV for output
+        gpu.device.CreateRenderTargetView(
             &output_res,
-            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart(),
+        );
+
+        // Set viewport + scissor to full output
+        let viewport = D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: output_w as f32,
+            Height: output_h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let scissor = windows::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: output_w as i32,
+            bottom: output_h as i32,
+        };
+        cmd_list.RSSetViewports(&[viewport]);
+        cmd_list.RSSetScissorRects(&[scissor]);
+
+        // Bind RTV
+        let rtv_handle = gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
+
+        // Render imgui overlay
+        overlay::render_frame(&cmd_list, gpu, output_w, output_h);
+
+        // Final barrier: output RENDER_TARGET → original FFX state
+        let barriers_after = [resource_barrier_transition_d3d12(
+            &output_res,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
             ffx_state_to_d3d12(d.output.state),
-        ),
-    ];
-    let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
-    if !valid_after.is_empty() {
-        cmd_list.ResourceBarrier(&valid_after);
+        )];
+        let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
+        if !valid_after.is_empty() {
+            cmd_list.ResourceBarrier(&valid_after);
+        }
+    } else {
+        // GPU pipeline unavailable — just restore original states directly.
+        let barriers_after = [
+            resource_barrier_transition_d3d12(
+                &color_res,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ffx_state_to_d3d12(d.color.state),
+            ),
+            resource_barrier_transition_d3d12(
+                &output_res,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                ffx_state_to_d3d12(d.output.state),
+            ),
+        ];
+        let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
+        if !valid_after.is_empty() {
+            cmd_list.ResourceBarrier(&valid_after);
+        }
     }
 
     0 // FFX_OK
