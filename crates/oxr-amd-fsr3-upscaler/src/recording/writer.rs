@@ -12,6 +12,17 @@ use windows::Win32::System::Threading::{
 
 use super::readback::BufferInfo;
 
+/// Allocate a `Vec<T>` of the given length without zeroing memory.
+///
+/// # Safety
+/// Caller must write every element before reading.
+#[inline]
+unsafe fn vec_uninit<T>(len: usize) -> Vec<T> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len) };
+    v
+}
+
 /// Pixel data extracted from a readback buffer.
 pub struct TextureData {
     pub data: Vec<u8>,
@@ -175,6 +186,69 @@ fn write_frame(session_dir: &PathBuf, packet: &FramePacket) -> Result<(), String
     );
 
     Ok(())
+}
+
+/// Convert raw texture data to f16 RGBA pixels based on DXGI format.
+/// For R16G16B16A16_FLOAT (the common case), this is a direct copy — no conversion needed.
+fn convert_to_rgba_f16(tex: &TextureData) -> Vec<half::f16> {
+    let w = tex.info.width as usize;
+    let h = tex.info.height as usize;
+    let pixel_count = w * h;
+
+    match tex.info.dxgi_format {
+        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => {
+            // 8 bytes per pixel, 4 × f16 — direct copy
+            // SAFETY: every element is written in the loop below before being read.
+            let mut out = unsafe { vec_uninit::<half::f16>(pixel_count * 4) };
+            for i in 0..pixel_count {
+                let offset = i * 8;
+                for c in 0..4 {
+                    let bits = u16::from_le_bytes([
+                        tex.data[offset + c * 2],
+                        tex.data[offset + c * 2 + 1],
+                    ]);
+                    out[i * 4 + c] = half::f16::from_bits(bits);
+                }
+            }
+            out
+        }
+        // All other formats: convert via f32 intermediary
+        _ => {
+            let f32_data = convert_to_rgba_f32(tex);
+            f32_data.into_iter().map(half::f16::from_f32).collect()
+        }
+    }
+}
+
+/// 2x box-filter downscale operating on f16 data.
+/// Converts each 2×2 block to f32 for averaging, then back to f16.
+fn downscale_2x_f16(
+    data: &[half::f16],
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> (usize, usize, Vec<half::f16>) {
+    let nw = width / 2;
+    let nh = height / 2;
+    // SAFETY: every element is written in the loop below before being read.
+    let mut out = unsafe { vec_uninit::<half::f16>(nw * nh * channels) };
+
+    for y in 0..nh {
+        for x in 0..nw {
+            let sx = x * 2;
+            let sy = y * 2;
+            let dst = (y * nw + x) * channels;
+            for c in 0..channels {
+                let p00 = data[((sy) * width + sx) * channels + c].to_f32();
+                let p10 = data[((sy) * width + sx + 1) * channels + c].to_f32();
+                let p01 = data[((sy + 1) * width + sx) * channels + c].to_f32();
+                let p11 = data[((sy + 1) * width + sx + 1) * channels + c].to_f32();
+                out[dst + c] = half::f16::from_f32((p00 + p10 + p01 + p11) * 0.25);
+            }
+        }
+    }
+
+    (nw, nh, out)
 }
 
 /// Convert raw texture data to f32 RGBA pixels based on DXGI format.
@@ -398,13 +472,13 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let mut h = tex.info.height as usize;
 
     let t0 = Instant::now();
-    let mut rgba = convert_to_rgba_f32(tex);
+    let mut rgba = convert_to_rgba_f16(tex);
     let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut downscale_ms = 0.0;
     if should_downscale(w, h) {
         let t1 = Instant::now();
-        let (nw, nh, scaled) = downscale_2x(&rgba, w, h, 4);
+        let (nw, nh, scaled) = downscale_2x_f16(&rgba, w, h, 4);
         downscale_ms = t1.elapsed().as_secs_f64() * 1000.0;
         w = nw;
         h = nh;
@@ -412,10 +486,11 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     }
 
     // Split into separate channels
-    let mut r = vec![0.0f32; w * h];
-    let mut g = vec![0.0f32; w * h];
-    let mut b = vec![0.0f32; w * h];
-    let mut a = vec![0.0f32; w * h];
+    // SAFETY: every element is written in the loop below before being read.
+    let mut r = unsafe { vec_uninit::<half::f16>(w * h) };
+    let mut g = unsafe { vec_uninit::<half::f16>(w * h) };
+    let mut b = unsafe { vec_uninit::<half::f16>(w * h) };
+    let mut a = unsafe { vec_uninit::<half::f16>(w * h) };
     for i in 0..w * h {
         r[i] = rgba[i * 4];
         g[i] = rgba[i * 4 + 1];
@@ -426,10 +501,10 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     use exr::prelude::*;
 
     let channels = AnyChannels::sort(smallvec![
-        AnyChannel::new("R", FlatSamples::F32(r)),
-        AnyChannel::new("G", FlatSamples::F32(g)),
-        AnyChannel::new("B", FlatSamples::F32(b)),
-        AnyChannel::new("A", FlatSamples::F32(a)),
+        AnyChannel::new("R", FlatSamples::F16(r)),
+        AnyChannel::new("G", FlatSamples::F16(g)),
+        AnyChannel::new("B", FlatSamples::F16(b)),
+        AnyChannel::new("A", FlatSamples::F16(a)),
     ]);
     let layer = Layer::new(
         (w, h),
