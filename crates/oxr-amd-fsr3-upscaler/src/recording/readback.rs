@@ -1,14 +1,14 @@
 use std::mem;
 use tracing::{error, info};
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_BOX, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_READBACK,
+    ID3D12Device, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList2, ID3D12Resource, D3D12_BOX,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_READBACK,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
-    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, ID3D12Device, ID3D12GraphicsCommandList,
-    ID3D12GraphicsCommandList2, ID3D12Resource,
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
 };
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -96,7 +96,10 @@ impl ReadbackPool {
             None,
             &mut resource,
         ) {
-            error!("readback: marker buffer CreateCommittedResource failed: {}", e);
+            error!(
+                "readback: marker buffer CreateCommittedResource failed: {}",
+                e
+            );
             return false;
         }
 
@@ -106,7 +109,10 @@ impl ReadbackPool {
         };
 
         self.marker_gpu_va = res.GetGPUVirtualAddress();
-        info!("readback: created marker buffer, gpu_va=0x{:x}", self.marker_gpu_va);
+        info!(
+            "readback: created marker buffer, gpu_va=0x{:x}",
+            self.marker_gpu_va
+        );
         self.marker_buffer = Some(res);
         true
     }

@@ -26,6 +26,8 @@ const MAX_QUEUE_DEPTH: u64 = 30;
 
 static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static QUEUED_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Persists across start/stop so we don't lose rising-edge state when RecorderState is dropped.
+static PREV_F10: AtomicBool = AtomicBool::new(false);
 
 struct RecorderState {
     pool: ReadbackPool,
@@ -34,7 +36,6 @@ struct RecorderState {
     frame_number: u64,
     parity: usize,
     warmup_frames: u8,
-    prev_f9: bool,
     /// Monotonic counter written by GPU via WriteBufferImmediate.
     write_counter: u32,
     /// Expected marker value per parity slot (set when GPU write is enqueued).
@@ -45,20 +46,14 @@ static RECORDER: Mutex<Option<RecorderState>> = Mutex::new(None);
 
 /// Called before dispatch. Checks hotkey, maps previous frame's readback, sends to writer.
 pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
-    let f9 = (GetAsyncKeyState(VK_F10) as u16 & 0x8000) != 0;
+    let f10_down = (GetAsyncKeyState(VK_F10) as u16 & 0x8000) != 0;
+    let prev = PREV_F10.swap(f10_down, Ordering::Relaxed);
+    let toggled = f10_down && !prev;
 
     let mut guard = match RECORDER.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
-
-    // Detect rising edge of F9
-    let prev_f9 = guard.as_ref().map(|s| s.prev_f9).unwrap_or(false);
-    let toggled = f9 && !prev_f9;
-
-    if let Some(state) = guard.as_mut() {
-        state.prev_f9 = f9;
-    }
 
     if toggled {
         if RECORDING_ACTIVE.load(Ordering::Relaxed) {
@@ -103,7 +98,6 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 frame_number: 0,
                 parity: 0,
                 warmup_frames: 2,
-                prev_f9: f9,
                 write_counter: 1,
                 expected_marker: [0; 3],
             });

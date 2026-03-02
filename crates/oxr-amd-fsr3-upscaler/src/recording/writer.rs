@@ -1,6 +1,7 @@
 use smallvec::smallvec;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::time::Instant;
 use tracing::{error, info};
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -86,7 +87,19 @@ fn writer_loop(rx: &mpsc::Receiver<WriterMessage>, session_dir: &PathBuf) {
 }
 
 fn write_frame(session_dir: &PathBuf, packet: &FramePacket) -> Result<(), String> {
+    let frame_start = Instant::now();
     let n = packet.frame_number;
+
+    // Determine recorded size from color texture (used for metadata)
+    let recorded_size = packet.color.as_ref().and_then(|tex| {
+        let w = tex.info.width as usize;
+        let h = tex.info.height as usize;
+        if should_downscale(w, h) {
+            Some((w / 2, h / 2))
+        } else {
+            None
+        }
+    });
 
     // Write color EXR
     if let Some(tex) = &packet.color {
@@ -108,7 +121,13 @@ fn write_frame(session_dir: &PathBuf, packet: &FramePacket) -> Result<(), String
 
     // Write metadata JSON
     let path = session_dir.join(format!("frame_{:06}_meta.json", n));
-    write_metadata_json(&path, &packet.metadata)?;
+    write_metadata_json(&path, &packet.metadata, recorded_size)?;
+
+    info!(
+        "writer: frame {} total={:.1}ms",
+        n,
+        frame_start.elapsed().as_secs_f64() * 1000.0,
+    );
 
     Ok(())
 }
@@ -330,9 +349,22 @@ fn convert_to_rg_f32(tex: &TextureData) -> Vec<f32> {
 }
 
 fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
-    let w = tex.info.width as usize;
-    let h = tex.info.height as usize;
-    let rgba = convert_to_rgba_f32(tex);
+    let mut w = tex.info.width as usize;
+    let mut h = tex.info.height as usize;
+
+    let t0 = Instant::now();
+    let mut rgba = convert_to_rgba_f32(tex);
+    let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let mut downscale_ms = 0.0;
+    if should_downscale(w, h) {
+        let t1 = Instant::now();
+        let (nw, nh, scaled) = downscale_2x(&rgba, w, h, 4);
+        downscale_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        w = nw;
+        h = nh;
+        rgba = scaled;
+    }
 
     // Split into separate channels
     let mut r = vec![0.0f32; w * h];
@@ -364,16 +396,38 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
         channels,
     );
     let image = Image::from_layer(layer);
+
+    let t2 = Instant::now();
     image
         .write()
         .to_file(path)
-        .map_err(|e| format!("write color EXR: {}", e))
+        .map_err(|e| format!("write color EXR: {}", e))?;
+    let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+    info!(
+        "writer: color convert={:.1}ms downscale={:.1}ms write={:.1}ms",
+        convert_ms, downscale_ms, write_ms,
+    );
+    Ok(())
 }
 
 fn write_depth_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
-    let w = tex.info.width as usize;
-    let h = tex.info.height as usize;
-    let depth = convert_to_r_f32(tex);
+    let mut w = tex.info.width as usize;
+    let mut h = tex.info.height as usize;
+
+    let t0 = Instant::now();
+    let mut depth = convert_to_r_f32(tex);
+    let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let mut downscale_ms = 0.0;
+    if should_downscale(w, h) {
+        let t1 = Instant::now();
+        let (nw, nh, scaled) = downscale_2x(&depth, w, h, 1);
+        downscale_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        w = nw;
+        h = nh;
+        depth = scaled;
+    }
 
     // Write single-channel EXR using the low-level API
     use exr::prelude::*;
@@ -390,16 +444,39 @@ fn write_depth_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
         channels,
     );
     let image = Image::from_layer(layer);
+
+    let t2 = Instant::now();
     image
         .write()
         .to_file(path)
-        .map_err(|e| format!("write depth EXR: {}", e))
+        .map_err(|e| format!("write depth EXR: {}", e))?;
+    let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+    info!(
+        "writer: depth convert={:.1}ms downscale={:.1}ms write={:.1}ms",
+        convert_ms, downscale_ms, write_ms,
+    );
+    Ok(())
 }
 
 fn write_mv_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
-    let w = tex.info.width as usize;
-    let h = tex.info.height as usize;
-    let mv = convert_to_rg_f32(tex);
+    let mut w = tex.info.width as usize;
+    let mut h = tex.info.height as usize;
+
+    let t0 = Instant::now();
+    let mut mv = convert_to_rg_f32(tex);
+    let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let mut downscale_ms = 0.0;
+    if should_downscale(w, h) {
+        // MV values are NOT rescaled — consumer uses render_size + recorded_size from metadata
+        let t1 = Instant::now();
+        let (nw, nh, scaled) = downscale_2x(&mv, w, h, 2);
+        downscale_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        w = nw;
+        h = nh;
+        mv = scaled;
+    }
 
     let mut mv_x = vec![0.0f32; w * h];
     let mut mv_y = vec![0.0f32; w * h];
@@ -424,13 +501,35 @@ fn write_mv_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
         channels,
     );
     let image = Image::from_layer(layer);
+
+    let t2 = Instant::now();
     image
         .write()
         .to_file(path)
-        .map_err(|e| format!("write mv EXR: {}", e))
+        .map_err(|e| format!("write mv EXR: {}", e))?;
+    let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+    info!(
+        "writer: mv convert={:.1}ms downscale={:.1}ms write={:.1}ms",
+        convert_ms, downscale_ms, write_ms,
+    );
+    Ok(())
 }
 
-fn write_metadata_json(path: &PathBuf, meta: &FrameMetadata) -> Result<(), String> {
+fn write_metadata_json(
+    path: &PathBuf,
+    meta: &FrameMetadata,
+    recorded_size: Option<(usize, usize)>,
+) -> Result<(), String> {
+    let downscale_fields = if let Some((rw, rh)) = recorded_size {
+        format!(
+            ",\n  \"downscaled\": true,\n  \"recorded_size\": [{}, {}]",
+            rw, rh
+        )
+    } else {
+        ",\n  \"downscaled\": false".to_string()
+    };
+
     let json = format!(
         r#"{{
   "jitter": [{}, {}],
@@ -443,7 +542,7 @@ fn write_metadata_json(path: &PathBuf, meta: &FrameMetadata) -> Result<(), Strin
   "motion_vector_scale": [{}, {}],
   "pre_exposure": {},
   "view_space_to_meters_factor": {},
-  "reset": {}
+  "reset": {}{}
 }}"#,
         meta.jitter_x,
         meta.jitter_y,
@@ -460,9 +559,45 @@ fn write_metadata_json(path: &PathBuf, meta: &FrameMetadata) -> Result<(), Strin
         meta.pre_exposure,
         meta.view_space_to_meters_factor,
         meta.reset,
+        downscale_fields,
     );
 
     std::fs::write(path, json).map_err(|e| format!("write metadata JSON: {}", e))
+}
+
+/// Returns `true` if the texture is larger than 4K and should be downscaled.
+fn should_downscale(width: usize, height: usize) -> bool {
+    width > 3840 || height > 2160
+}
+
+/// 2x box-filter downscale: averages each 2x2 block of pixels.
+/// Works for any channel count (1, 2, 4). Odd dimensions use floor division.
+fn downscale_2x(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> (usize, usize, Vec<f32>) {
+    let nw = width / 2;
+    let nh = height / 2;
+    let mut out = vec![0.0f32; nw * nh * channels];
+
+    for y in 0..nh {
+        for x in 0..nw {
+            let sx = x * 2;
+            let sy = y * 2;
+            let dst = (y * nw + x) * channels;
+            for c in 0..channels {
+                let p00 = data[((sy) * width + sx) * channels + c];
+                let p10 = data[((sy) * width + sx + 1) * channels + c];
+                let p01 = data[((sy + 1) * width + sx) * channels + c];
+                let p11 = data[((sy + 1) * width + sx + 1) * channels + c];
+                out[dst + c] = (p00 + p10 + p01 + p11) * 0.25;
+            }
+        }
+    }
+
+    (nw, nh, out)
 }
 
 /// Unpack an 11-bit float (R11G11B10_FLOAT R or G channel) to f32.
