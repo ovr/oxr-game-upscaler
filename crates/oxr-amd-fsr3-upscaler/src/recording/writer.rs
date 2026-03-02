@@ -3,8 +3,12 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Instant;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+};
 
 use super::readback::BufferInfo;
 
@@ -49,6 +53,36 @@ pub enum WriterMessage {
     Shutdown,
 }
 
+/// Pin the writer thread to the last logical core and lower its priority
+/// so it doesn't compete with game render threads.
+fn set_thread_affinity() {
+    unsafe {
+        let mut sys_info = SYSTEM_INFO::default();
+        GetSystemInfo(&mut sys_info);
+        let num_cpus = sys_info.dwNumberOfProcessors as usize;
+        if num_cpus == 0 {
+            warn!("writer: GetSystemInfo returned 0 CPUs, skipping affinity");
+            return;
+        }
+
+        let mask = 1usize << (num_cpus - 1);
+        let thread = GetCurrentThread();
+
+        let prev = SetThreadAffinityMask(thread, mask);
+        if prev == 0 {
+            warn!("writer: SetThreadAffinityMask failed, continuing without affinity");
+        } else {
+            info!("writer: pinned to core {} (mask=0x{:x})", num_cpus - 1, mask);
+        }
+
+        if let Err(e) = SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL) {
+            warn!("writer: SetThreadPriority failed: {}", e);
+        } else {
+            info!("writer: priority set to BELOW_NORMAL");
+        }
+    }
+}
+
 /// Spawn the background writer thread. Returns the sender channel.
 pub fn spawn_writer(session_dir: PathBuf) -> mpsc::Sender<WriterMessage> {
     let (tx, rx) = mpsc::channel::<WriterMessage>();
@@ -56,6 +90,7 @@ pub fn spawn_writer(session_dir: PathBuf) -> mpsc::Sender<WriterMessage> {
     std::thread::Builder::new()
         .name("recording-writer".into())
         .spawn(move || {
+            set_thread_affinity();
             info!("writer: thread started, dir={}", session_dir.display());
             writer_loop(&rx, &session_dir);
             info!("writer: thread exiting");
