@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12Device, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList2,
@@ -21,11 +21,11 @@ use writer::{FrameMetadata, FramePacket, TextureData, WriterMessage};
 
 const VK_F10: i32 = 0x79;
 
-/// Max queued frames before we start dropping.
-const MAX_QUEUE_DEPTH: u64 = 30;
+/// 40 GiB buffer limit — when queued data exceeds this, recording stops automatically.
+pub(crate) const MAX_BUFFER_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 
-static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
-static QUEUED_FRAMES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub(crate) static QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Persists across start/stop so we don't lose rising-edge state when RecorderState is dropped.
 static PREV_F10: AtomicBool = AtomicBool::new(false);
 
@@ -36,10 +36,12 @@ struct RecorderState {
     frame_number: u64,
     parity: usize,
     warmup_frames: u8,
+    /// When true, GPU hasn't caught up — skip post_dispatch copies until marker is ready.
+    stalled: bool,
     /// Monotonic counter written by GPU via WriteBufferImmediate.
     write_counter: u32,
     /// Expected marker value per parity slot (set when GPU write is enqueued).
-    expected_marker: [u32; 3],
+    expected_marker: [u32; 4],
 }
 
 static RECORDER: Mutex<Option<RecorderState>> = Mutex::new(None);
@@ -63,7 +65,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 let _ = state.sender.send(WriterMessage::Shutdown);
             }
             RECORDING_ACTIVE.store(false, Ordering::Relaxed);
-            QUEUED_FRAMES.store(0, Ordering::Relaxed);
+            QUEUED_BYTES.store(0, Ordering::Relaxed);
             info!("recording: stopped");
             return;
         } else {
@@ -97,9 +99,10 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 _session_dir: session_dir.clone(),
                 frame_number: 0,
                 parity: 0,
-                warmup_frames: 2,
+                warmup_frames: 3,
+                stalled: false,
                 write_counter: 1,
-                expected_marker: [0; 3],
+                expected_marker: [0; 4],
             });
             RECORDING_ACTIVE.store(true, Ordering::Relaxed);
             info!("recording: started → {}", session_dir.display());
@@ -123,37 +126,33 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         return;
     }
 
-    // Backpressure check
-    if QUEUED_FRAMES.load(Ordering::Relaxed) > MAX_QUEUE_DEPTH {
-        warn!(
-            "recording: backpressure, skipping frame {} (queue > {})",
-            state.frame_number, MAX_QUEUE_DEPTH
+    // Buffer limit check — stop recording when exceeded
+    let queued = QUEUED_BYTES.load(Ordering::Relaxed);
+    if queued >= MAX_BUFFER_BYTES {
+        info!(
+            "recording: buffer limit reached ({:.1} GiB), stopping",
+            queued as f64 / (1024.0 * 1024.0 * 1024.0)
         );
-        state.frame_number += 1;
+        if let Some(state) = guard.take() {
+            let _ = state.sender.send(WriterMessage::Shutdown);
+        }
+        RECORDING_ACTIVE.store(false, Ordering::Relaxed);
         return;
     }
 
-    let prev_parity = (state.parity + 1) % 3;
+    let prev_parity = (state.parity + 1) % 4;
 
     // Check GPU completion marker before reading back
     let expected = state.expected_marker[prev_parity];
     if expected != 0 {
         match state.pool.read_marker(prev_parity) {
-            Some(marker) if marker == expected => {}
-            Some(marker) => {
-                warn!(
-                    "recording: marker not ready for parity {} (got={}, expected={}), skipping frame {}",
-                    prev_parity, marker, expected, state.frame_number
-                );
-                state.frame_number += 1;
-                return;
+            Some(marker) if marker == expected => {
+                state.stalled = false;
             }
-            None => {
-                warn!(
-                    "recording: failed to read marker for parity {}, skipping frame {}",
-                    prev_parity, state.frame_number
-                );
-                state.frame_number += 1;
+            Some(_) | None => {
+                // GPU hasn't finished yet — stall: don't read, don't enqueue new copies.
+                // Next dispatch will retry the same slot.
+                state.stalled = true;
                 return;
             }
         }
@@ -191,8 +190,13 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         reset: d.reset,
     };
 
+    let packet_bytes = color.as_ref().map_or(0, |t| t.data.len() as u64)
+        + depth.as_ref().map_or(0, |t| t.data.len() as u64)
+        + motion_vectors.as_ref().map_or(0, |t| t.data.len() as u64);
+
     let packet = FramePacket {
         frame_number: state.frame_number,
+        packet_bytes,
         color,
         depth,
         motion_vectors,
@@ -201,7 +205,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
 
     match state.sender.send(WriterMessage::Frame(packet)) {
         Ok(()) => {
-            QUEUED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            QUEUED_BYTES.fetch_add(packet_bytes, Ordering::Relaxed);
         }
         Err(_) => {
             error!("recording: writer channel closed, disabling recording");
@@ -228,6 +232,11 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         Some(s) => s,
         None => return,
     };
+
+    // Don't enqueue new copies while stalled — previous slot hasn't been read yet.
+    if state.stalled {
+        return;
+    }
 
     let cmd_list_raw = d.command_list;
     if cmd_list_raw.is_null() {
@@ -354,5 +363,5 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     }
 
     // Advance parity for next frame
-    state.parity = (state.parity + 1) % 3;
+    state.parity = (state.parity + 1) % 4;
 }

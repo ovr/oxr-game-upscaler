@@ -27,7 +27,7 @@ pub enum Slot {
 }
 
 const NUM_SLOTS: usize = 3;
-const NUM_PARITY: usize = 3;
+const NUM_PARITY: usize = 4;
 
 /// Info about a readback buffer's layout.
 #[derive(Clone, Debug)]
@@ -39,7 +39,7 @@ pub struct BufferInfo {
     pub bpp: u32,
 }
 
-/// Triple-buffered readback pool: 3 slots × 3 parities.
+/// Quad-buffered readback pool: 3 slots × 4 parities (3 frames of GPU latency).
 pub struct ReadbackPool {
     buffers: [[Option<ID3D12Resource>; NUM_PARITY]; NUM_SLOTS],
     infos: [[Option<BufferInfo>; NUM_PARITY]; NUM_SLOTS],

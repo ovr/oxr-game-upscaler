@@ -148,6 +148,31 @@ pub unsafe fn render_frame(
                     upscaler_type::debug_view_set(debug_on);
                     info!("overlay: debug_view={}", debug_on);
                 }
+
+                // Recording status
+                #[cfg(feature = "recording")]
+                {
+                    use crate::recording;
+                    use std::sync::atomic::Ordering;
+
+                    ui.separator();
+
+                    let active = recording::RECORDING_ACTIVE.load(Ordering::Relaxed);
+                    if active {
+                        let _color =
+                            ui.push_style_color(imgui::StyleColor::Text, [1.0, 0.2, 0.2, 1.0]);
+                        ui.text("REC");
+                    } else {
+                        let _color =
+                            ui.push_style_color(imgui::StyleColor::Text, [0.5, 0.5, 0.5, 1.0]);
+                        ui.text("REC OFF");
+                    }
+
+                    let queued = recording::QUEUED_BYTES.load(Ordering::Relaxed);
+                    let used_gib = queued as f64 / (1024.0 * 1024.0 * 1024.0);
+                    let max_gib = recording::MAX_BUFFER_BYTES as f64 / (1024.0 * 1024.0 * 1024.0);
+                    ui.text(format!("{:.1} / {:.1} GiB", used_gib, max_gib));
+                }
             });
 
         title_active_tok.pop();

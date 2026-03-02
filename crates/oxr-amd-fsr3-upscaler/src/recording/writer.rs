@@ -1,5 +1,6 @@
 use smallvec::smallvec;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Instant;
 use tracing::{error, info};
@@ -35,6 +36,8 @@ pub struct FrameMetadata {
 /// A frame packet sent to the writer thread.
 pub struct FramePacket {
     pub frame_number: u64,
+    /// Total raw bytes of texture data in this packet (for buffer accounting).
+    pub packet_bytes: u64,
     pub color: Option<TextureData>,
     pub depth: Option<TextureData>,
     pub motion_vectors: Option<TextureData>,
@@ -78,9 +81,12 @@ fn writer_loop(rx: &mpsc::Receiver<WriterMessage>, session_dir: &PathBuf) {
                 break;
             }
             WriterMessage::Frame(packet) => {
+                let bytes = packet.packet_bytes;
                 if let Err(e) = write_frame(session_dir, &packet) {
                     error!("writer: frame {} failed: {}", packet.frame_number, e);
                 }
+                drop(packet);
+                super::QUEUED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
             }
         }
     }
