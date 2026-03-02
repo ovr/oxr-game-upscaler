@@ -454,7 +454,7 @@ unsafe fn draw_debug_tiles(
 }
 
 /// Borrow a COM resource from a raw FFX pointer, returning None if null.
-unsafe fn borrow_resource(raw: *mut core::ffi::c_void) -> Option<ID3D12Resource> {
+pub(crate) unsafe fn borrow_resource(raw: *mut core::ffi::c_void) -> Option<ID3D12Resource> {
     if raw.is_null() {
         return None;
     }
@@ -622,7 +622,7 @@ const FFX_RESOURCE_STATE_PRESENT: u32 = 1 << 7;
 const FFX_RESOURCE_STATE_RENDER_TARGET: u32 = 1 << 8;
 
 /// Map FFX resource state to D3D12 resource state.
-fn ffx_state_to_d3d12(state: u32) -> D3D12_RESOURCE_STATES {
+pub(crate) fn ffx_state_to_d3d12(state: u32) -> D3D12_RESOURCE_STATES {
     let mut d3d_state = D3D12_RESOURCE_STATES(0);
 
     if state & FFX_RESOURCE_STATE_UNORDERED_ACCESS != 0 {
@@ -659,7 +659,7 @@ fn ffx_state_to_d3d12(state: u32) -> D3D12_RESOURCE_STATES {
 }
 
 /// Build a transition barrier from FFX state → D3D12 target state.
-fn resource_barrier_transition(
+pub(crate) fn resource_barrier_transition(
     resource: &ID3D12Resource,
     state_before_ffx: u32,
     state_after: D3D12_RESOURCE_STATES,
@@ -669,7 +669,7 @@ fn resource_barrier_transition(
 }
 
 /// Build a transition barrier between two D3D12 states, returning None if they're equal.
-fn resource_barrier_transition_d3d12(
+pub(crate) fn resource_barrier_transition_d3d12(
     resource: &ID3D12Resource,
     state_before: D3D12_RESOURCE_STATES,
     state_after: D3D12_RESOURCE_STATES,

@@ -33,7 +33,7 @@ pub unsafe fn init() {
 }
 
 /// Returns the directory containing the loaded DLL.
-fn dll_directory() -> Option<PathBuf> {
+pub(crate) fn dll_directory() -> Option<PathBuf> {
     use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
     let mut buf = vec![0u16; 512];

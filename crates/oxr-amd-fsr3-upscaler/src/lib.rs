@@ -5,6 +5,8 @@ mod gpu_pipeline;
 mod imgui_renderer;
 mod logging;
 mod overlay;
+#[cfg(feature = "recording")]
+mod recording;
 mod upscaler_type;
 
 use core::ffi::c_void;
@@ -171,15 +173,23 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
         "ffxFsr3UpscalerContextDispatch"
     );
 
-    if rw == uw && rh == uh {
-        info!("AA mode (no upscale), CopyResource passthrough");
-        return dispatch::dispatch_anti_aliasing(d);
-    }
+    #[cfg(feature = "recording")]
+    recording::pre_dispatch(d);
 
-    let start = std::time::Instant::now();
-    let result = dispatch::dispatch_upscale(d);
-    let elapsed = start.elapsed();
-    info!(elapsed_us = elapsed.as_micros(), "dispatch total");
+    let result = if rw == uw && rh == uh {
+        info!("AA mode (no upscale), CopyResource passthrough");
+        dispatch::dispatch_anti_aliasing(d)
+    } else {
+        let start = std::time::Instant::now();
+        let result = dispatch::dispatch_upscale(d);
+        let elapsed = start.elapsed();
+        info!(elapsed_us = elapsed.as_micros(), "dispatch total");
+        result
+    };
+
+    #[cfg(feature = "recording")]
+    recording::post_dispatch(d);
+
     result
 }
 

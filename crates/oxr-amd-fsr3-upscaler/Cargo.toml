@@ -23,3 +23,19 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[features]
+debug = []
+recording = ["exr", "half", "smallvec"]
+
+[dependencies.exr]
+version = "1.73"
+optional = true
+
+[dependencies.half]
+version = "2"
+optional = true
+
+[dependencies.smallvec]
+version = "1"
+optional = true
