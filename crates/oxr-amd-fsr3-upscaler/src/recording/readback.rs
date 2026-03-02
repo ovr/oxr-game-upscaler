@@ -340,12 +340,19 @@ impl ReadbackPool {
             return None;
         }
 
-        let mut data = vec![0u8; total_bytes];
-        for row in 0..info.height as usize {
-            let src = mapped.add(row * info.row_pitch as usize);
-            let dst = data.as_mut_ptr().add(row * row_bytes);
-            std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+        let mut data = Vec::with_capacity(total_bytes);
+        if info.row_pitch as usize == row_bytes {
+            // No padding — single bulk copy
+            std::ptr::copy_nonoverlapping(mapped, data.as_mut_ptr(), total_bytes);
+        } else {
+            // Strip pitch padding row-by-row
+            for row in 0..info.height as usize {
+                let src = mapped.add(row * info.row_pitch as usize);
+                let dst = data.as_mut_ptr().add(row * row_bytes);
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
         }
+        data.set_len(total_bytes);
 
         readback.Unmap(0, None);
 

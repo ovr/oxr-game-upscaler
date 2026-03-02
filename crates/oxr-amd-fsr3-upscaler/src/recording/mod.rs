@@ -47,6 +47,8 @@ struct RecorderState {
     stride_counter: u64,
     /// Set by pre_dispatch when the current frame should be skipped per stride setting.
     skip_this_frame: bool,
+    /// Frames remaining before we drop the pool (lets in-flight GPU copies finish).
+    drain_frames: u8,
 }
 
 static RECORDER: Mutex<Option<RecorderState>> = Mutex::new(None);
@@ -64,14 +66,14 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
 
     if toggled {
         if RECORDING_ACTIVE.load(Ordering::Relaxed) {
-            // Stop recording
-            info!("recording: stopping");
-            if let Some(state) = guard.take() {
-                let _ = state.sender.send(WriterMessage::Shutdown);
-            }
+            // Stop recording — defer pool drop to let in-flight GPU copies finish
+            info!("recording: stopping (draining 4 frames)");
             RECORDING_ACTIVE.store(false, Ordering::Relaxed);
             QUEUED_BYTES.store(0, Ordering::Relaxed);
-            info!("recording: stopped");
+            if let Some(state) = guard.as_mut() {
+                let _ = state.sender.send(WriterMessage::Shutdown);
+                state.drain_frames = 4;
+            }
             return;
         } else {
             // Start recording
@@ -110,6 +112,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 expected_marker: [0; 4],
                 stride_counter: 0,
                 skip_this_frame: false,
+                drain_frames: 0,
             });
             RECORDING_ACTIVE.store(true, Ordering::Relaxed);
             info!("recording: started → {}", session_dir.display());
@@ -119,6 +122,18 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
 
     // If recording, map previous frame's readback and send to writer
     if !RECORDING_ACTIVE.load(Ordering::Relaxed) {
+        // Drain: keep pool alive for a few frames so in-flight GPU copies complete
+        if let Some(state) = guard.as_mut() {
+            if state.drain_frames > 0 {
+                state.drain_frames -= 1;
+                if state.drain_frames == 0 {
+                    info!("recording: drain complete, leaking pool (GPU safety)");
+                    if let Some(state) = guard.take() {
+                        std::mem::forget(state);
+                    }
+                }
+            }
+        }
         return;
     }
 
@@ -150,13 +165,14 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     let queued = QUEUED_BYTES.load(Ordering::Relaxed);
     if queued >= MAX_BUFFER_BYTES {
         info!(
-            "recording: buffer limit reached ({:.1} GiB), stopping",
+            "recording: buffer limit reached ({:.1} GiB), stopping (draining 4 frames)",
             queued as f64 / (1024.0 * 1024.0 * 1024.0)
         );
-        if let Some(state) = guard.take() {
-            let _ = state.sender.send(WriterMessage::Shutdown);
-        }
         RECORDING_ACTIVE.store(false, Ordering::Relaxed);
+        if let Some(state) = guard.as_mut() {
+            let _ = state.sender.send(WriterMessage::Shutdown);
+            state.drain_frames = 4;
+        }
         return;
     }
 
