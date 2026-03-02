@@ -1,4 +1,5 @@
 mod readback;
+pub mod stride;
 mod writer;
 
 use std::path::PathBuf;
@@ -42,6 +43,10 @@ struct RecorderState {
     write_counter: u32,
     /// Expected marker value per parity slot (set when GPU write is enqueued).
     expected_marker: [u32; 4],
+    /// Frame counter for stride logic (increments every dispatch while recording).
+    stride_counter: u64,
+    /// Set by pre_dispatch when the current frame should be skipped per stride setting.
+    skip_this_frame: bool,
 }
 
 static RECORDER: Mutex<Option<RecorderState>> = Mutex::new(None);
@@ -103,6 +108,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 stalled: false,
                 write_counter: 1,
                 expected_marker: [0; 4],
+                stride_counter: 0,
+                skip_this_frame: false,
             });
             RECORDING_ACTIVE.store(true, Ordering::Relaxed);
             info!("recording: started → {}", session_dir.display());
@@ -124,6 +131,19 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         // Need 2 frames of GPU latency before readback is safe
         state.warmup_frames -= 1;
         return;
+    }
+
+    // Stride: skip frames based on configured stride
+    match stride::get() {
+        stride::Stride::EverySecond if state.stride_counter % 2 == 1 => {
+            state.skip_this_frame = true;
+            state.stride_counter += 1;
+            return;
+        }
+        _ => {
+            state.skip_this_frame = false;
+            state.stride_counter += 1;
+        }
     }
 
     // Buffer limit check — stop recording when exceeded
@@ -235,6 +255,11 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
 
     // Don't enqueue new copies while stalled — previous slot hasn't been read yet.
     if state.stalled {
+        return;
+    }
+
+    // Skip GPU copies when stride says to skip this frame.
+    if state.skip_this_frame {
         return;
     }
 

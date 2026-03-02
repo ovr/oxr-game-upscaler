@@ -172,6 +172,20 @@ pub unsafe fn render_frame(
                     let used_gib = queued as f64 / (1024.0 * 1024.0 * 1024.0);
                     let max_gib = recording::MAX_BUFFER_BYTES as f64 / (1024.0 * 1024.0 * 1024.0);
                     ui.text(format!("{:.1} / {:.1} GiB", used_gib, max_gib));
+
+                    // Stride selector
+                    use recording::stride::{self, Stride};
+                    let mut current_stride = stride::get();
+                    ui.text("Stride");
+                    if ui.radio_button("Disabled", &mut current_stride, Stride::Disabled) {
+                        stride::set(current_stride);
+                        info!("overlay: stride={:?}", current_stride);
+                    }
+                    ui.same_line();
+                    if ui.radio_button("Every 2nd", &mut current_stride, Stride::EverySecond) {
+                        stride::set(current_stride);
+                        info!("overlay: stride={:?}", current_stride);
+                    }
                 }
             });
 

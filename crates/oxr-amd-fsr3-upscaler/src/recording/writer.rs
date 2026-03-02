@@ -72,7 +72,11 @@ fn set_thread_affinity() {
         if prev == 0 {
             warn!("writer: SetThreadAffinityMask failed, continuing without affinity");
         } else {
-            info!("writer: pinned to core {} (mask=0x{:x})", num_cpus - 1, mask);
+            info!(
+                "writer: pinned to core {} (mask=0x{:x})",
+                num_cpus - 1,
+                mask
+            );
         }
 
         if let Err(e) = SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL) {
