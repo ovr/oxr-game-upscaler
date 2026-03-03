@@ -12,12 +12,14 @@ const VS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_vs.hlsl");
 const PS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_ps.hlsl");
 const LANCZOS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/lanczos_ps.hlsl");
 const DEBUG_PS_SOURCE: &[u8] = include_bytes!("alg-scale/debug_ps.hlsl");
+const SGSR_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv1/sgsr_ps.hlsl");
 
 pub struct GpuState {
     pub device: ID3D12Device,
     pub root_signature: ID3D12RootSignature,
     pub pso_bilinear: ID3D12PipelineState,
     pub pso_lanczos: ID3D12PipelineState,
+    pub pso_sgsr: ID3D12PipelineState,
     pub pso_debug: ID3D12PipelineState,
     pub srv_heap: ID3D12DescriptorHeap,
     pub rtv_heap: ID3D12DescriptorHeap,
@@ -84,6 +86,7 @@ unsafe fn try_init(
     let vs_blob = compile_shader(VS_SOURCE, b"VS\0", b"vs_5_0\0")?;
     let ps_blob = compile_shader(PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     let lanczos_ps_blob = compile_shader(LANCZOS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
+    let sgsr_ps_blob = compile_shader(SGSR_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     let debug_ps_blob = compile_shader(DEBUG_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     info!("gpu_pipeline: shaders compiled");
 
@@ -105,6 +108,18 @@ unsafe fn try_init(
     )?;
     info!(
         "gpu_pipeline: PSO created (lanczos, format={:?})",
+        typed_format
+    );
+
+    let pso_sgsr = create_pso(
+        &device,
+        &root_signature,
+        &vs_blob,
+        &sgsr_ps_blob,
+        typed_format,
+    )?;
+    info!(
+        "gpu_pipeline: PSO created (sgsr, format={:?})",
         typed_format
     );
 
@@ -134,6 +149,7 @@ unsafe fn try_init(
         root_signature,
         pso_bilinear,
         pso_lanczos,
+        pso_sgsr,
         pso_debug,
         srv_heap,
         rtv_heap,

@@ -139,6 +139,11 @@ pub unsafe fn render_frame(
                     upscaler_type::set(active);
                     info!("overlay: switched to {:?}", active);
                 }
+                ui.same_line();
+                if ui.radio_button("SGSR", &mut active, UpscalerType::SGSR) {
+                    upscaler_type::set(active);
+                    info!("overlay: switched to {:?}", active);
+                }
 
                 ui.separator();
 

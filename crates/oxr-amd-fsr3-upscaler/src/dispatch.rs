@@ -185,6 +185,7 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     let pso = match upscaler_type::get() {
         upscaler_type::UpscalerType::Bilinear => &gpu.pso_bilinear,
         upscaler_type::UpscalerType::Lanczos => &gpu.pso_lanczos,
+        upscaler_type::UpscalerType::SGSR => &gpu.pso_sgsr,
     };
     cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
     cmd_list.SetPipelineState(pso);
