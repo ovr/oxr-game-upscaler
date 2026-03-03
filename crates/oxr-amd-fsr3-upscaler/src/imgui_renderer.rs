@@ -3,41 +3,14 @@
 /// Follows the pattern of `imgui_impl_dx12.cpp` from the Dear ImGui repository.
 /// Uses our existing `windows = "0.58"` COM types to avoid dependency conflicts.
 use std::mem;
-use tracing::{error, info};
+use tracing::info;
 use windows::core::PCSTR;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-// --- HLSL shaders (inline) ---------------------------------------------------
-
-const IMGUI_VS: &[u8] = b"
-cbuffer vertexBuffer : register(b0)
-{
-    float4x4 ProjectionMatrix;
-};
-struct VS_INPUT { float2 pos : POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };
-struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };
-PS_INPUT VS(VS_INPUT input)
-{
-    PS_INPUT output;
-    output.pos = mul(ProjectionMatrix, float4(input.pos.xy, 0.f, 1.f));
-    output.col = input.col;
-    output.uv  = input.uv;
-    return output;
-}
-\0";
-
-const IMGUI_PS: &[u8] = b"
-struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };
-SamplerState sampler0 : register(s0);
-Texture2D texture0    : register(t0);
-float4 PS(PS_INPUT input) : SV_Target
-{
-    return input.col * texture0.Sample(sampler0, input.uv);
-}
-\0";
+const IMGUI_VS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/imgui_vs.dxil"));
+const IMGUI_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/imgui_ps.dxil"));
 
 // --- Per-frame resources (UPLOAD heap VB/IB) ---------------------------------
 
@@ -492,35 +465,6 @@ fn transition_barrier(
     barrier
 }
 
-unsafe fn compile_shader(source: &[u8], entry: &[u8], target: &[u8]) -> Result<ID3DBlob, String> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    let hr = D3DCompile(
-        source.as_ptr() as *const _,
-        source.len(),
-        None,
-        None,
-        None,
-        PCSTR(entry.as_ptr()),
-        PCSTR(target.as_ptr()),
-        0,
-        0,
-        &mut code,
-        Some(&mut errors),
-    );
-    if let Some(err) = &errors {
-        let ptr = err.GetBufferPointer() as *const u8;
-        let len = err.GetBufferSize();
-        let msg = std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len));
-        if hr.is_err() {
-            error!("imgui shader compile error: {}", msg.trim_end_matches('\0'));
-            return Err(format!("D3DCompile failed: {}", msg.trim_end_matches('\0')));
-        }
-    }
-    hr.map_err(|e| format!("D3DCompile: {e}"))?;
-    Ok(code.unwrap())
-}
-
 unsafe fn create_imgui_root_signature(
     device: &ID3D12Device,
 ) -> Result<ID3D12RootSignature, String> {
@@ -608,16 +552,13 @@ unsafe fn create_imgui_pso(
     root_sig: &ID3D12RootSignature,
     rt_format: DXGI_FORMAT,
 ) -> Result<ID3D12PipelineState, String> {
-    let vs_blob = compile_shader(IMGUI_VS, b"VS\0", b"vs_5_0\0")?;
-    let ps_blob = compile_shader(IMGUI_PS, b"PS\0", b"ps_5_0\0")?;
-
     let vs_bytecode = D3D12_SHADER_BYTECODE {
-        pShaderBytecode: vs_blob.GetBufferPointer(),
-        BytecodeLength: vs_blob.GetBufferSize(),
+        pShaderBytecode: IMGUI_VS_DXIL.as_ptr() as *const _,
+        BytecodeLength: IMGUI_VS_DXIL.len(),
     };
     let ps_bytecode = D3D12_SHADER_BYTECODE {
-        pShaderBytecode: ps_blob.GetBufferPointer(),
-        BytecodeLength: ps_blob.GetBufferSize(),
+        pShaderBytecode: IMGUI_PS_DXIL.as_ptr() as *const _,
+        BytecodeLength: IMGUI_PS_DXIL.len(),
     };
 
     // Input layout matching imgui::DrawVert

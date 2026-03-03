@@ -1,0 +1,7 @@
+struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };
+SamplerState sampler0 : register(s0);
+Texture2D texture0    : register(t0);
+float4 PS(PS_INPUT input) : SV_Target
+{
+    return input.col * texture0.Sample(sampler0, input.uv);
+}

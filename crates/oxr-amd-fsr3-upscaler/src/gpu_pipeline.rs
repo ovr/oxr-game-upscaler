@@ -1,22 +1,20 @@
 use std::sync::OnceLock;
 use tracing::{error, info, warn};
-use windows::core::PCSTR;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::fsr3_types::FfxSurfaceFormat;
 
-const VS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_vs.hlsl");
-const PS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_ps.hlsl");
-const LANCZOS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/lanczos_ps.hlsl");
-const DEBUG_PS_SOURCE: &[u8] = include_bytes!("alg-scale/debug_ps.hlsl");
-const SGSR_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv1/sgsr_ps.hlsl");
-const RCAS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/rcas_ps.hlsl");
-const SGSR2_VS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv2/sgsr2_vs.hlsl");
-const SGSR2_CONVERT_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv2/sgsr2_convert_ps.hlsl");
-const SGSR2_UPSCALE_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv2/sgsr2_upscale_ps.hlsl");
+const VS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blit_vs.dxil"));
+const PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blit_ps.dxil"));
+const LANCZOS_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lanczos_ps.dxil"));
+const DEBUG_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug_ps.dxil"));
+const SGSR_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv1_sgsr_ps.dxil"));
+const RCAS_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rcas_ps.dxil"));
+const SGSR2_VS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_vs.dxil"));
+const SGSR2_CONVERT_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_convert_ps.dxil"));
+const SGSR2_UPSCALE_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_upscale_ps.dxil"));
 
 pub struct GpuState {
     pub device: ID3D12Device,
@@ -100,21 +98,10 @@ unsafe fn try_init(
         output_format, output_format.0, typed_format, typed_format.0
     );
 
-    let vs_blob = compile_shader(VS_SOURCE, b"VS\0", b"vs_5_0\0")?;
-    let ps_blob = compile_shader(PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
-    let lanczos_ps_blob = compile_shader(LANCZOS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
-    let sgsr_ps_blob = compile_shader(SGSR_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
-    let debug_ps_blob = compile_shader(DEBUG_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
-    let rcas_ps_blob = compile_shader(RCAS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
-    let sgsr2_vs_blob = compile_shader(SGSR2_VS_SOURCE, b"VS\0", b"vs_5_0\0")?;
-    let sgsr2_convert_ps_blob = compile_shader(SGSR2_CONVERT_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
-    let sgsr2_upscale_ps_blob = compile_shader(SGSR2_UPSCALE_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
-    info!("gpu_pipeline: shaders compiled");
-
     let root_signature = create_root_signature(&device)?;
     info!("gpu_pipeline: root signature created");
 
-    let pso_bilinear = create_pso(&device, &root_signature, &vs_blob, &ps_blob, typed_format)?;
+    let pso_bilinear = create_pso(&device, &root_signature, VS_DXIL, PS_DXIL, typed_format)?;
     info!(
         "gpu_pipeline: PSO created (bilinear, format={:?})",
         typed_format
@@ -123,8 +110,8 @@ unsafe fn try_init(
     let pso_lanczos = create_pso(
         &device,
         &root_signature,
-        &vs_blob,
-        &lanczos_ps_blob,
+        VS_DXIL,
+        LANCZOS_PS_DXIL,
         typed_format,
     )?;
     info!(
@@ -135,8 +122,8 @@ unsafe fn try_init(
     let pso_sgsr = create_pso(
         &device,
         &root_signature,
-        &vs_blob,
-        &sgsr_ps_blob,
+        VS_DXIL,
+        SGSR_PS_DXIL,
         typed_format,
     )?;
     info!(
@@ -147,8 +134,8 @@ unsafe fn try_init(
     let pso_debug = create_pso(
         &device,
         &root_signature,
-        &vs_blob,
-        &debug_ps_blob,
+        VS_DXIL,
+        DEBUG_PS_DXIL,
         typed_format,
     )?;
     info!(
@@ -159,8 +146,8 @@ unsafe fn try_init(
     let pso_rcas = create_pso(
         &device,
         &root_signature,
-        &vs_blob,
-        &rcas_ps_blob,
+        VS_DXIL,
+        RCAS_PS_DXIL,
         typed_format,
     )?;
     info!(
@@ -175,8 +162,8 @@ unsafe fn try_init(
     let pso_sgsr2_convert = create_pso(
         &device,
         &sgsr2_root_signature,
-        &sgsr2_vs_blob,
-        &sgsr2_convert_ps_blob,
+        SGSR2_VS_DXIL,
+        SGSR2_CONVERT_PS_DXIL,
         DXGI_FORMAT_R16G16B16A16_FLOAT,
     )?;
     info!("gpu_pipeline: PSO created (sgsr2_convert)");
@@ -184,8 +171,8 @@ unsafe fn try_init(
     let pso_sgsr2_upscale = create_pso(
         &device,
         &sgsr2_root_signature,
-        &sgsr2_vs_blob,
-        &sgsr2_upscale_ps_blob,
+        SGSR2_VS_DXIL,
+        SGSR2_UPSCALE_PS_DXIL,
         typed_format,
     )?;
     info!(
@@ -223,42 +210,6 @@ unsafe fn try_init(
         rtv_descriptor_size,
         rt_format: typed_format,
     })
-}
-
-unsafe fn compile_shader(source: &[u8], entry: &[u8], target: &[u8]) -> Result<ID3DBlob, String> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-
-    let hr = D3DCompile(
-        source.as_ptr() as *const _,
-        source.len(),
-        None,
-        None,
-        None,
-        PCSTR(entry.as_ptr()),
-        PCSTR(target.as_ptr()),
-        0,
-        0,
-        &mut code,
-        Some(&mut errors),
-    );
-
-    if let Some(err_blob) = &errors {
-        let err_ptr = err_blob.GetBufferPointer() as *const u8;
-        let err_len = err_blob.GetBufferSize();
-        let err_msg = std::str::from_utf8_unchecked(std::slice::from_raw_parts(err_ptr, err_len));
-        let trimmed = err_msg.trim_end_matches('\0');
-        if hr.is_err() {
-            error!("Shader compile error: {}", trimmed);
-            return Err(format!("D3DCompile failed: {}", trimmed));
-        }
-    }
-
-    if let Err(e) = hr {
-        return Err(format!("D3DCompile failed: {}", e));
-    }
-
-    code.ok_or_else(|| "D3DCompile produced no code".to_string())
 }
 
 unsafe fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature, String> {
@@ -452,18 +403,18 @@ unsafe fn create_sgsr2_root_signature(
 unsafe fn create_pso(
     device: &ID3D12Device,
     root_sig: &ID3D12RootSignature,
-    vs_blob: &ID3DBlob,
-    ps_blob: &ID3DBlob,
+    vs_dxil: &[u8],
+    ps_dxil: &[u8],
     rt_format: DXGI_FORMAT,
 ) -> Result<ID3D12PipelineState, String> {
     let vs_bytecode = D3D12_SHADER_BYTECODE {
-        pShaderBytecode: vs_blob.GetBufferPointer(),
-        BytecodeLength: vs_blob.GetBufferSize(),
+        pShaderBytecode: vs_dxil.as_ptr() as *const _,
+        BytecodeLength: vs_dxil.len(),
     };
 
     let ps_bytecode = D3D12_SHADER_BYTECODE {
-        pShaderBytecode: ps_blob.GetBufferPointer(),
-        BytecodeLength: ps_blob.GetBufferSize(),
+        pShaderBytecode: ps_dxil.as_ptr() as *const _,
+        BytecodeLength: ps_dxil.len(),
     };
 
     let mut rt_formats = [DXGI_FORMAT_UNKNOWN; 8];
