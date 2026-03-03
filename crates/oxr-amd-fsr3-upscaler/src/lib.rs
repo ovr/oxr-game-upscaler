@@ -7,6 +7,7 @@ mod logging;
 mod overlay;
 #[cfg(feature = "recording")]
 mod recording;
+mod sgsr2_state;
 mod upscaler_type;
 
 use core::ffi::c_void;

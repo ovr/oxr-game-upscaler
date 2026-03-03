@@ -14,6 +14,9 @@ const LANCZOS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/lanczos_ps.hlsl");
 const DEBUG_PS_SOURCE: &[u8] = include_bytes!("alg-scale/debug_ps.hlsl");
 const SGSR_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv1/sgsr_ps.hlsl");
 const RCAS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/rcas_ps.hlsl");
+const SGSR2_VS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv2/sgsr2_vs.hlsl");
+const SGSR2_CONVERT_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv2/sgsr2_convert_ps.hlsl");
+const SGSR2_UPSCALE_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv2/sgsr2_upscale_ps.hlsl");
 
 pub struct GpuState {
     pub device: ID3D12Device,
@@ -23,6 +26,9 @@ pub struct GpuState {
     pub pso_sgsr: ID3D12PipelineState,
     pub pso_debug: ID3D12PipelineState,
     pub pso_rcas: ID3D12PipelineState,
+    pub sgsr2_root_signature: ID3D12RootSignature,
+    pub pso_sgsr2_convert: ID3D12PipelineState,
+    pub pso_sgsr2_upscale: ID3D12PipelineState,
     pub srv_heap: ID3D12DescriptorHeap,
     pub rtv_heap: ID3D12DescriptorHeap,
     pub srv_descriptor_size: u32,
@@ -100,6 +106,9 @@ unsafe fn try_init(
     let sgsr_ps_blob = compile_shader(SGSR_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     let debug_ps_blob = compile_shader(DEBUG_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     let rcas_ps_blob = compile_shader(RCAS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
+    let sgsr2_vs_blob = compile_shader(SGSR2_VS_SOURCE, b"VS\0", b"vs_5_0\0")?;
+    let sgsr2_convert_ps_blob = compile_shader(SGSR2_CONVERT_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
+    let sgsr2_upscale_ps_blob = compile_shader(SGSR2_UPSCALE_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     info!("gpu_pipeline: shaders compiled");
 
     let root_signature = create_root_signature(&device)?;
@@ -159,10 +168,37 @@ unsafe fn try_init(
         typed_format
     );
 
-    // Slot 0: blit color SRV, Slot 1: imgui font SRV, Slots 2-8: debug textures, Slot 9: spare
+    // --- SGSRv2: separate root signature with 32 root constants + 3 SRVs ---
+    let sgsr2_root_signature = create_sgsr2_root_signature(&device)?;
+    info!("gpu_pipeline: SGSRv2 root signature created");
+
+    let pso_sgsr2_convert = create_pso(
+        &device,
+        &sgsr2_root_signature,
+        &sgsr2_vs_blob,
+        &sgsr2_convert_ps_blob,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+    )?;
+    info!("gpu_pipeline: PSO created (sgsr2_convert)");
+
+    let pso_sgsr2_upscale = create_pso(
+        &device,
+        &sgsr2_root_signature,
+        &sgsr2_vs_blob,
+        &sgsr2_upscale_ps_blob,
+        typed_format,
+    )?;
+    info!(
+        "gpu_pipeline: PSO created (sgsr2_upscale, format={:?})",
+        typed_format
+    );
+
+    // Slot 0: blit color SRV, Slot 1: imgui font SRV, Slots 2-8: debug textures, Slot 9: RCAS
+    // Slots 10-11: SGSRv2 convert (depth, velocity), Slots 12-14: SGSRv2 upscale (prev, mdc, color)
     let srv_heap =
-        create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 10, true)?;
-    let rtv_heap = create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false)?;
+        create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 20, true)?;
+    // Slots 0-1: existing, Slot 2: SGSRv2 MotionDepthClip RTV, Slot 3: SGSRv2 history write RTV
+    let rtv_heap = create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 6, false)?;
     info!("gpu_pipeline: descriptor heaps created");
 
     let srv_descriptor_size =
@@ -178,6 +214,9 @@ unsafe fn try_init(
         pso_sgsr,
         pso_debug,
         pso_rcas,
+        sgsr2_root_signature,
+        pso_sgsr2_convert,
+        pso_sgsr2_upscale,
         srv_heap,
         rtv_heap,
         srv_descriptor_size,
@@ -311,6 +350,103 @@ unsafe fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSigna
             std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()),
         )
         .map_err(|e| format!("CreateRootSignature failed: {}", e))
+}
+
+unsafe fn create_sgsr2_root_signature(
+    device: &ID3D12Device,
+) -> Result<ID3D12RootSignature, String> {
+    // 32 root constants (b0): clipToPrevClip[4] (16) + renderSize (2) + outputSize (2)
+    // + renderSizeRcp (2) + outputSizeRcp (2) + jitterOffset (2) + scaleRatio (2)
+    // + cameraFovAngleHor (1) + minLerpContribution (1) + reset (1) + bSameCamera (1) = 32
+    let constants = D3D12_ROOT_CONSTANTS {
+        ShaderRegister: 0,
+        RegisterSpace: 0,
+        Num32BitValues: 32,
+    };
+
+    let srv_range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 3,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    };
+
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: constants,
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &srv_range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+    ];
+
+    let static_sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 0,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+        MinLOD: 0.0,
+        MaxLOD: f32::MAX,
+        ShaderRegister: 0,
+        RegisterSpace: 0,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    };
+
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: 1,
+        pStaticSamplers: &static_sampler,
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+    };
+
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error_blob: Option<ID3DBlob> = None;
+
+    if let Err(e) = D3D12SerializeRootSignature(
+        &desc,
+        D3D_ROOT_SIGNATURE_VERSION_1,
+        &mut blob,
+        Some(&mut error_blob),
+    ) {
+        if let Some(err_blob) = &error_blob {
+            let err_ptr = err_blob.GetBufferPointer() as *const u8;
+            let err_len = err_blob.GetBufferSize();
+            let err_msg =
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(err_ptr, err_len));
+            error!(
+                "SGSRv2 D3D12SerializeRootSignature error: {}",
+                err_msg.trim_end_matches('\0')
+            );
+        }
+        return Err(format!("SGSRv2 D3D12SerializeRootSignature failed: {}", e));
+    }
+
+    let blob =
+        blob.ok_or_else(|| "SGSRv2 D3D12SerializeRootSignature produced no blob".to_string())?;
+
+    device
+        .CreateRootSignature(
+            0,
+            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()),
+        )
+        .map_err(|e| format!("SGSRv2 CreateRootSignature failed: {}", e))
 }
 
 unsafe fn create_pso(

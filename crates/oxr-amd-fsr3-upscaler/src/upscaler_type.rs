@@ -5,6 +5,7 @@ pub enum UpscalerType {
     Bilinear = 0,
     Lanczos = 1,
     SGSR = 2,
+    SGSRv2 = 3,
 }
 
 static ACTIVE: AtomicU8 = AtomicU8::new(UpscalerType::Lanczos as u8);
@@ -13,6 +14,7 @@ pub fn get() -> UpscalerType {
     match ACTIVE.load(Ordering::Relaxed) {
         0 => UpscalerType::Bilinear,
         2 => UpscalerType::SGSR,
+        3 => UpscalerType::SGSRv2,
         _ => UpscalerType::Lanczos,
     }
 }

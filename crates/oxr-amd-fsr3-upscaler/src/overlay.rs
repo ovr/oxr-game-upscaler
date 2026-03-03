@@ -144,6 +144,11 @@ pub unsafe fn render_frame(
                     upscaler_type::set(active);
                     info!("overlay: switched to {:?}", active);
                 }
+                ui.same_line();
+                if ui.radio_button("SGSRv2", &mut active, UpscalerType::SGSRv2) {
+                    upscaler_type::set(active);
+                    info!("overlay: switched to {:?}", active);
+                }
 
                 // RCAS checkbox
                 let mut rcas_on = upscaler_type::rcas_get();
