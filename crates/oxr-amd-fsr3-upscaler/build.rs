@@ -20,8 +20,12 @@ fn main() {
     ];
 
     let dxc = Dxc::new(None).expect("Failed to load DXC library");
-    let compiler = dxc.create_compiler().expect("Failed to create DXC compiler");
-    let library = dxc.create_library().expect("Failed to create DXC library interface");
+    let compiler = dxc
+        .create_compiler()
+        .expect("Failed to create DXC compiler");
+    let library = dxc
+        .create_library()
+        .expect("Failed to create DXC library interface");
 
     for &(src_path, entry, profile) in shaders {
         let full_path = shader_dir.join(src_path);
@@ -34,15 +38,7 @@ fn main() {
             .create_blob_with_encoding_from_str(&source)
             .unwrap_or_else(|e| panic!("Failed to create blob for {}: {}", src_path, e));
 
-        let result = compiler.compile(
-            &blob,
-            src_path,
-            entry,
-            profile,
-            &["-O3"],
-            None,
-            &[],
-        );
+        let result = compiler.compile(&blob, src_path, entry, profile, &["-O3"], None, &[]);
 
         let dxc_result = match result {
             Ok(r) => r,

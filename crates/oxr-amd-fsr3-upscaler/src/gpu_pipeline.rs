@@ -13,8 +13,10 @@ const DEBUG_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/debug_ps.
 const SGSR_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv1_sgsr_ps.dxil"));
 const RCAS_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rcas_ps.dxil"));
 const SGSR2_VS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_vs.dxil"));
-const SGSR2_CONVERT_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_convert_ps.dxil"));
-const SGSR2_UPSCALE_PS_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_upscale_ps.dxil"));
+const SGSR2_CONVERT_PS_DXIL: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_convert_ps.dxil"));
+const SGSR2_UPSCALE_PS_DXIL: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/SGSRv2_sgsr2_upscale_ps.dxil"));
 
 pub struct GpuState {
     pub device: ID3D12Device,
