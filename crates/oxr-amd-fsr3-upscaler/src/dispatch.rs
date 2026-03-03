@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use crate::fsr3_types::*;
 use crate::gpu_pipeline::{self, GpuState};
 use crate::overlay;
@@ -5,7 +7,77 @@ use crate::upscaler_type;
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+use windows::Win32::Graphics::Dxgi::Common::*;
+
+struct RcasResources {
+    temp_rt: ID3D12Resource,
+    width: u32,
+    height: u32,
+}
+
+static RCAS_TEMP: Mutex<Option<RcasResources>> = Mutex::new(None);
+
+/// Ensure the RCAS temp render target exists at the given dimensions and format.
+/// Returns a clone of the ID3D12Resource.
+unsafe fn ensure_rcas_temp(
+    device: &ID3D12Device,
+    w: u32,
+    h: u32,
+    format: DXGI_FORMAT,
+) -> Result<ID3D12Resource, String> {
+    let mut guard = RCAS_TEMP.lock().map_err(|_| "RCAS_TEMP mutex poisoned")?;
+
+    if let Some(res) = guard.as_ref() {
+        if res.width == w && res.height == h {
+            return Ok(res.temp_rt.clone());
+        }
+    }
+
+    // Create or recreate
+    let heap_props = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Alignment: 0,
+        Width: w as u64,
+        Height: h,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    };
+
+    let mut resource: Option<ID3D12Resource> = None;
+    device
+        .CreateCommittedResource(
+            &heap_props,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            None,
+            &mut resource,
+        )
+        .map_err(|e| format!("CreateCommittedResource for RCAS temp RT failed: {}", e))?;
+
+    let resource = resource.ok_or("CreateCommittedResource returned null")?;
+    info!("RCAS temp RT created: {}x{} format={:?}", w, h, format);
+
+    *guard = Some(RcasResources {
+        temp_rt: resource.clone(),
+        width: w,
+        height: h,
+    });
+
+    Ok(resource)
+}
 
 /// Create an SRV with an explicit typed format descriptor.
 /// Converts FFX format → DXGI, then typeless → typed, so resources like R32_TYPELESS
@@ -174,33 +246,26 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     // --- Create SRV for color texture (explicit typed format) ---
     create_typed_srv(gpu, &color_res, d.color.description.format, 0);
 
-    // --- Create RTV for output texture ---
-    gpu.device.CreateRenderTargetView(
-        &output_res,
-        None, // default RTV desc
-        gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart(),
-    );
+    // --- Create RTV for output texture (slot 0) ---
+    gpu.device
+        .CreateRenderTargetView(&output_res, None, gpu_pipeline::get_rtv_cpu_handle(gpu, 0));
+
+    // --- Determine if RCAS post-pass is needed ---
+    let current_upscaler = upscaler_type::get();
+    let use_rcas = upscaler_type::rcas_get()
+        && matches!(
+            current_upscaler,
+            upscaler_type::UpscalerType::Bilinear | upscaler_type::UpscalerType::Lanczos
+        );
 
     // --- Set pipeline state ---
-    let pso = match upscaler_type::get() {
+    let pso = match current_upscaler {
         upscaler_type::UpscalerType::Bilinear => &gpu.pso_bilinear,
         upscaler_type::UpscalerType::Lanczos => &gpu.pso_lanczos,
         upscaler_type::UpscalerType::SGSR => &gpu.pso_sgsr,
     };
-    cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
-    cmd_list.SetPipelineState(pso);
-    cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
 
-    // Root constants: uvScale (slots 0–1) + inputSize (slots 2–3)
-    cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_x.to_bits(), 0);
-    cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_y.to_bits(), 1);
-    cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_w as f32).to_bits(), 2);
-    cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_h as f32).to_bits(), 3);
-
-    // Descriptor table: SRV
-    cmd_list.SetGraphicsRootDescriptorTable(1, gpu.srv_heap.GetGPUDescriptorHandleForHeapStart());
-
-    // --- Viewport + scissor ---
+    // --- Viewport + scissor (shared by both passes) ---
     let viewport = D3D12_VIEWPORT {
         TopLeftX: 0.0,
         TopLeftY: 0.0,
@@ -215,24 +280,156 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
         right: output_w as i32,
         bottom: output_h as i32,
     };
-    cmd_list.RSSetViewports(&[viewport]);
-    cmd_list.RSSetScissorRects(&[scissor]);
 
-    // --- Set render target ---
-    let rtv_handle = gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart();
-    cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
+    // Try to get temp RT for RCAS; fall back to single pass on failure
+    let rcas_temp = if use_rcas {
+        match ensure_rcas_temp(&gpu.device, output_w, output_h, gpu.rt_format) {
+            Ok(rt) => Some(rt),
+            Err(e) => {
+                error!("dispatch_upscale: RCAS temp RT creation failed: {}, falling back to single pass", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    // --- Draw fullscreen triangle ---
-    cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cmd_list.DrawInstanced(3, 1, 0, 0);
-    gpu_pipeline::log_device_removed_reason(&gpu.device);
+    if let Some(temp_rt) = rcas_temp {
+        // --- Pass 1: upscale color → temp_rt ---
+        // Barrier: temp_rt PIXEL_SHADER_RESOURCE → RENDER_TARGET
+        let barrier_temp_to_rt = resource_barrier_transition_d3d12(
+            &temp_rt,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+        if let Some(b) = &barrier_temp_to_rt {
+            cmd_list.ResourceBarrier(&[b.clone()]);
+        }
 
-    info!(
-        render = format_args!("{}x{}", render_w, render_h),
-        output = format_args!("{}x{}", output_w, output_h),
-        uv_scale = format_args!("({:.3}, {:.3})", uv_scale_x, uv_scale_y),
-        "DrawInstanced upscale blit"
-    );
+        // Create RTV for temp_rt at slot 1
+        gpu.device
+            .CreateRenderTargetView(&temp_rt, None, gpu_pipeline::get_rtv_cpu_handle(gpu, 1));
+
+        cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
+        cmd_list.SetPipelineState(pso);
+        cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
+
+        // Root constants: uvScale + inputSize
+        cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_x.to_bits(), 0);
+        cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_y.to_bits(), 1);
+        cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_w as f32).to_bits(), 2);
+        cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_h as f32).to_bits(), 3);
+
+        // SRV: color texture at slot 0
+        cmd_list
+            .SetGraphicsRootDescriptorTable(1, gpu.srv_heap.GetGPUDescriptorHandleForHeapStart());
+
+        cmd_list.RSSetViewports(&[viewport]);
+        cmd_list.RSSetScissorRects(&[scissor]);
+
+        let rtv_temp = gpu_pipeline::get_rtv_cpu_handle(gpu, 1);
+        cmd_list.OMSetRenderTargets(1, Some(&rtv_temp), false, None);
+
+        cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd_list.DrawInstanced(3, 1, 0, 0);
+
+        // --- Barrier: temp_rt RENDER_TARGET → PIXEL_SHADER_RESOURCE ---
+        let barrier_temp_to_srv = resource_barrier_transition_d3d12(
+            &temp_rt,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
+        if let Some(b) = &barrier_temp_to_srv {
+            cmd_list.ResourceBarrier(&[b.clone()]);
+        }
+
+        // --- Pass 2: RCAS temp_rt → output ---
+        // Create SRV for temp_rt at slot 9
+        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: gpu.rt_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        gpu.device.CreateShaderResourceView(
+            &temp_rt,
+            Some(&srv_desc),
+            gpu_pipeline::get_srv_cpu_handle(gpu, 9),
+        );
+
+        // Create RTV for output at slot 0
+        gpu.device.CreateRenderTargetView(
+            &output_res,
+            None,
+            gpu_pipeline::get_rtv_cpu_handle(gpu, 0),
+        );
+
+        cmd_list.SetPipelineState(&gpu.pso_rcas);
+
+        // Root constant: sharpness = exp2(-0.0) = 1.0 (maximum sharpness)
+        let sharpness: f32 = 1.0;
+        cmd_list.SetGraphicsRoot32BitConstant(0, sharpness.to_bits(), 0);
+
+        // Bind temp_rt SRV at slot 9
+        cmd_list.SetGraphicsRootDescriptorTable(1, gpu_pipeline::get_srv_gpu_handle(gpu, 9));
+
+        cmd_list.RSSetViewports(&[viewport]);
+        cmd_list.RSSetScissorRects(&[scissor]);
+
+        let rtv_output = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
+        cmd_list.OMSetRenderTargets(1, Some(&rtv_output), false, None);
+
+        cmd_list.DrawInstanced(3, 1, 0, 0);
+        gpu_pipeline::log_device_removed_reason(&gpu.device);
+
+        info!(
+            render = format_args!("{}x{}", render_w, render_h),
+            output = format_args!("{}x{}", output_w, output_h),
+            uv_scale = format_args!("({:.3}, {:.3})", uv_scale_x, uv_scale_y),
+            "DrawInstanced upscale+RCAS (2-pass)"
+        );
+    } else {
+        // === Single pass: upscale → output ===
+        cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
+        cmd_list.SetPipelineState(pso);
+        cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
+
+        // Root constants: uvScale (slots 0–1) + inputSize (slots 2–3)
+        cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_x.to_bits(), 0);
+        cmd_list.SetGraphicsRoot32BitConstant(0, uv_scale_y.to_bits(), 1);
+        cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_w as f32).to_bits(), 2);
+        cmd_list.SetGraphicsRoot32BitConstant(0, (color_tex_h as f32).to_bits(), 3);
+
+        // Descriptor table: SRV
+        cmd_list
+            .SetGraphicsRootDescriptorTable(1, gpu.srv_heap.GetGPUDescriptorHandleForHeapStart());
+
+        cmd_list.RSSetViewports(&[viewport]);
+        cmd_list.RSSetScissorRects(&[scissor]);
+
+        // --- Set render target ---
+        let rtv_handle = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
+        cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
+
+        // --- Draw fullscreen triangle ---
+        cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd_list.DrawInstanced(3, 1, 0, 0);
+        gpu_pipeline::log_device_removed_reason(&gpu.device);
+
+        info!(
+            render = format_args!("{}x{}", render_w, render_h),
+            output = format_args!("{}x{}", output_w, output_h),
+            uv_scale = format_args!("({:.3}, {:.3})", uv_scale_x, uv_scale_y),
+            "DrawInstanced upscale blit"
+        );
+    }
 
     // --- Debug view overlay (draws debug tiles on top of the upscaled image) ---
     if upscaler_type::debug_view_get() {
@@ -550,7 +747,7 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
         gpu.device.CreateRenderTargetView(
             &output_res,
             None,
-            gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart(),
+            gpu_pipeline::get_rtv_cpu_handle(gpu, 0),
         );
 
         // Set viewport + scissor to full output
@@ -572,7 +769,7 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
         cmd_list.RSSetScissorRects(&[scissor]);
 
         // Bind RTV
-        let rtv_handle = gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let rtv_handle = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
         cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
 
         // Render imgui overlay

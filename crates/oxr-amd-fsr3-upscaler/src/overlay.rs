@@ -145,6 +145,13 @@ pub unsafe fn render_frame(
                     info!("overlay: switched to {:?}", active);
                 }
 
+                // RCAS checkbox
+                let mut rcas_on = upscaler_type::rcas_get();
+                if ui.checkbox("RCAS", &mut rcas_on) {
+                    upscaler_type::rcas_set(rcas_on);
+                    info!("overlay: rcas={}", rcas_on);
+                }
+
                 ui.separator();
 
                 // Debug View checkbox
@@ -203,7 +210,7 @@ pub unsafe fn render_frame(
 
     // --- Render ---
     let frame_idx = state.frame_idx;
-    let rtv_handle = gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+    let rtv_handle = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
     if let Err(e) = state
         .renderer
         .render(draw_data, cmd_list, frame_idx, &gpu.srv_heap, rtv_handle)

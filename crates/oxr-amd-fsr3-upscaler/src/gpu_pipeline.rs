@@ -13,6 +13,7 @@ const PS_SOURCE: &[u8] = include_bytes!("alg-scale/blit_ps.hlsl");
 const LANCZOS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/lanczos_ps.hlsl");
 const DEBUG_PS_SOURCE: &[u8] = include_bytes!("alg-scale/debug_ps.hlsl");
 const SGSR_PS_SOURCE: &[u8] = include_bytes!("alg-scale/SGSRv1/sgsr_ps.hlsl");
+const RCAS_PS_SOURCE: &[u8] = include_bytes!("alg-scale/rcas_ps.hlsl");
 
 pub struct GpuState {
     pub device: ID3D12Device,
@@ -21,9 +22,11 @@ pub struct GpuState {
     pub pso_lanczos: ID3D12PipelineState,
     pub pso_sgsr: ID3D12PipelineState,
     pub pso_debug: ID3D12PipelineState,
+    pub pso_rcas: ID3D12PipelineState,
     pub srv_heap: ID3D12DescriptorHeap,
     pub rtv_heap: ID3D12DescriptorHeap,
     pub srv_descriptor_size: u32,
+    pub rtv_descriptor_size: u32,
     pub rt_format: DXGI_FORMAT,
 }
 
@@ -44,6 +47,14 @@ pub unsafe fn get_srv_gpu_handle(gpu: &GpuState, slot: u32) -> D3D12_GPU_DESCRIP
     let base = gpu.srv_heap.GetGPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE {
         ptr: base.ptr + (slot * gpu.srv_descriptor_size) as u64,
+    }
+}
+
+/// Return the CPU descriptor handle for slot `slot` in the RTV heap.
+pub unsafe fn get_rtv_cpu_handle(gpu: &GpuState, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    let base = gpu.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: base.ptr + (slot * gpu.rtv_descriptor_size) as usize,
     }
 }
 
@@ -88,6 +99,7 @@ unsafe fn try_init(
     let lanczos_ps_blob = compile_shader(LANCZOS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     let sgsr_ps_blob = compile_shader(SGSR_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     let debug_ps_blob = compile_shader(DEBUG_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
+    let rcas_ps_blob = compile_shader(RCAS_PS_SOURCE, b"PS\0", b"ps_5_0\0")?;
     info!("gpu_pipeline: shaders compiled");
 
     let root_signature = create_root_signature(&device)?;
@@ -135,14 +147,28 @@ unsafe fn try_init(
         typed_format
     );
 
+    let pso_rcas = create_pso(
+        &device,
+        &root_signature,
+        &vs_blob,
+        &rcas_ps_blob,
+        typed_format,
+    )?;
+    info!(
+        "gpu_pipeline: PSO created (rcas, format={:?})",
+        typed_format
+    );
+
     // Slot 0: blit color SRV, Slot 1: imgui font SRV, Slots 2-8: debug textures, Slot 9: spare
     let srv_heap =
         create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 10, true)?;
-    let rtv_heap = create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false)?;
+    let rtv_heap = create_descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false)?;
     info!("gpu_pipeline: descriptor heaps created");
 
     let srv_descriptor_size =
         device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    let rtv_descriptor_size =
+        device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     Ok(GpuState {
         device,
@@ -151,9 +177,11 @@ unsafe fn try_init(
         pso_lanczos,
         pso_sgsr,
         pso_debug,
+        pso_rcas,
         srv_heap,
         rtv_heap,
         srv_descriptor_size,
+        rtv_descriptor_size,
         rt_format: typed_format,
     })
 }

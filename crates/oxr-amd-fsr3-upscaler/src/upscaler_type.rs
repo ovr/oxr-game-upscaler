@@ -21,6 +21,16 @@ pub fn set(t: UpscalerType) {
     ACTIVE.store(t as u8, Ordering::Relaxed);
 }
 
+static RCAS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn rcas_get() -> bool {
+    RCAS_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn rcas_set(on: bool) {
+    RCAS_ENABLED.store(on, Ordering::Relaxed);
+}
+
 static DEBUG_VIEW: AtomicBool = AtomicBool::new(false);
 
 pub fn debug_view_get() -> bool {
