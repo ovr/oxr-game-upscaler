@@ -8,7 +8,7 @@ pub enum UpscalerType {
     SGSRv2 = 3,
 }
 
-static ACTIVE: AtomicU8 = AtomicU8::new(UpscalerType::Lanczos as u8);
+static ACTIVE: AtomicU8 = AtomicU8::new(UpscalerType::SGSRv2 as u8);
 
 pub fn get() -> UpscalerType {
     match ACTIVE.load(Ordering::Relaxed) {
@@ -23,7 +23,7 @@ pub fn set(t: UpscalerType) {
     ACTIVE.store(t as u8, Ordering::Relaxed);
 }
 
-static RCAS_ENABLED: AtomicBool = AtomicBool::new(true);
+static RCAS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn rcas_get() -> bool {
     RCAS_ENABLED.load(Ordering::Relaxed)
