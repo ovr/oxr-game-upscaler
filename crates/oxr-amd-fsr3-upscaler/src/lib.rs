@@ -7,6 +7,7 @@ mod logging;
 mod overlay;
 #[cfg(feature = "recording")]
 mod recording;
+mod settings;
 mod sgsr2_state;
 mod sgsr2_three_pass_state;
 mod upscaler_type;
@@ -61,6 +62,7 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut ()) -> bool
     match reason {
         DLL_PROCESS_ATTACH => {
             logging::init();
+            settings::init();
             info!("upscaler: {:?}", upscaler_type::get());
             info!("oxr-amd-fsr3-upscaler: loading original");
             let wname: Vec<u16> = "ffx_fsr3upscaler_x64_original.dll\0"
@@ -203,6 +205,10 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextGenerateReactiveMask(
     (FN_TABLE.get().unwrap().GenReactiveMask)(ctx, desc)
 }
 
+fn is_spatial_upscaler() -> bool {
+    (upscaler_type::get() as u8) <= 2 // Bilinear=0, Lanczos=1, SGSR=2
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerGetJitterOffset(
     ox: *mut f32,
@@ -210,12 +216,20 @@ pub unsafe extern "C" fn ffxFsr3UpscalerGetJitterOffset(
     idx: i32,
     pc: i32,
 ) -> u32 {
-    (FN_TABLE.get().unwrap().GetJitterOffset)(ox, oy, idx, pc)
+    // TODO: unconditionally disabled for testing
+    if !ox.is_null() {
+        *ox = 0.0;
+    }
+    if !oy.is_null() {
+        *oy = 0.0;
+    }
+    0 // FFX_OK
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerGetJitterPhaseCount(rw: i32, dw: i32) -> i32 {
-    (FN_TABLE.get().unwrap().GetJitterPhCount)(rw, dw)
+    // TODO: unconditionally disabled for testing
+    1
 }
 
 #[no_mangle]
@@ -279,4 +293,9 @@ pub unsafe extern "C" fn ffxAssertReport(
 #[no_mangle]
 pub unsafe extern "C" fn ffxAssertSetPrintingCallback(cb: *mut c_void) {
     (FN_TABLE.get().unwrap().AssertSetCb)(cb)
+}
+
+#[no_mangle]
+pub extern "C" fn oxr_get_upscaler_type() -> u8 {
+    upscaler_type::get() as u8
 }

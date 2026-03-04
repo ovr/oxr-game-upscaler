@@ -59,6 +59,8 @@ pub struct FramePacket {
     pub frame_number: u64,
     /// Total raw bytes of texture data in this packet (for buffer accounting).
     pub packet_bytes: u64,
+    /// Burst number for Burst8 mode (None for non-burst modes).
+    pub burst_number: Option<u64>,
     pub color: Option<TextureData>,
     pub depth: Option<TextureData>,
     pub motion_vectors: Option<TextureData>,
@@ -164,27 +166,32 @@ fn write_frame(session_dir: &PathBuf, packet: &FramePacket) -> Result<(), String
         }
     });
 
+    let fname = |suffix: &str, ext: &str| -> PathBuf {
+        match packet.burst_number {
+            Some(b) => {
+                session_dir.join(format!("burst_{:03}_frame_{:06}_{}.{}", b, n, suffix, ext))
+            }
+            None => session_dir.join(format!("frame_{:06}_{}.{}", n, suffix, ext)),
+        }
+    };
+
     // Write color EXR
     if let Some(tex) = &packet.color {
-        let path = session_dir.join(format!("frame_{:06}_color.exr", n));
-        write_color_exr(&path, tex)?;
+        write_color_exr(&fname("color", "exr"), tex)?;
     }
 
     // Write depth EXR
     if let Some(tex) = &packet.depth {
-        let path = session_dir.join(format!("frame_{:06}_depth.exr", n));
-        write_depth_exr(&path, tex)?;
+        write_depth_exr(&fname("depth", "exr"), tex)?;
     }
 
     // Write motion vectors EXR
     if let Some(tex) = &packet.motion_vectors {
-        let path = session_dir.join(format!("frame_{:06}_mv.exr", n));
-        write_mv_exr(&path, tex)?;
+        write_mv_exr(&fname("mv", "exr"), tex)?;
     }
 
     // Write metadata JSON
-    let path = session_dir.join(format!("frame_{:06}_meta.json", n));
-    write_metadata_json(&path, &packet.metadata, recorded_size)?;
+    write_metadata_json(&fname("meta", "json"), &packet.metadata, recorded_size)?;
 
     info!(
         "writer: frame {} total={:.1}ms",

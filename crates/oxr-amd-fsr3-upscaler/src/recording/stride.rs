@@ -9,9 +9,9 @@ pub enum Stride {
 }
 
 /// Burst8: record 8 frames, skip for ~3 seconds.
-/// At 60fps, 3s ≈ 180 frames. Total cycle = 8 + 180 = 188.
+/// At 60fps, ~3.3s ≈ 200 frames. Total cycle = 8 + 200 = 208.
 pub const BURST_RECORD: u64 = 8;
-const BURST_SKIP: u64 = 180;
+const BURST_SKIP: u64 = 200;
 const BURST_CYCLE: u64 = BURST_RECORD + BURST_SKIP;
 
 /// Position within the current burst cycle (0..BURST_CYCLE-1).

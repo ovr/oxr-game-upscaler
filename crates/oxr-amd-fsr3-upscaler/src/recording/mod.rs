@@ -16,8 +16,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 use crate::dispatch;
 use crate::fsr3_types::FfxFsr3UpscalerDispatchDescription;
-use crate::logging;
-
 use extractor::{estimate_slot_bytes, DeferredFramePacket, DeferredTextureData, ExtractorMessage};
 use readback::{is_depth_stencil_format, ReadbackPool, Slot};
 use writer::{FrameMetadata, FramePacket, TextureData, WriterMessage};
@@ -54,6 +52,8 @@ struct RecorderState {
     /// Frames remaining before we drop the pool (lets in-flight GPU copies finish).
     drain_frames: u8,
     // --- Burst8 state ---
+    /// Monotonic burst group number (incremented at each new burst cycle).
+    burst_number: u64,
     /// How many frames have been GPU-captured in the current burst (0..=8).
     burst_captured: u8,
     /// Next burst frame index to drain via CPU readback (0..burst_captured).
@@ -99,8 +99,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             return;
         } else {
             // Start recording
-            let dll_dir = logging::dll_directory().unwrap_or_else(|| PathBuf::from("."));
-            let recordings_dir = dll_dir.join("recordings");
+            let recordings_dir = crate::settings::get().recording_path.clone();
             if let Err(e) = std::fs::create_dir_all(&recordings_dir) {
                 error!("recording: failed to create recordings dir: {}", e);
                 return;
@@ -137,6 +136,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 stride_counter: 0,
                 skip_this_frame: false,
                 drain_frames: 0,
+                burst_number: 0,
                 burst_captured: 0,
                 burst_drain_idx: 0,
                 burst_metadata: Default::default(),
@@ -194,6 +194,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                             let packet = DeferredFramePacket {
                                 frame_number: state.frame_number,
                                 estimated_bytes,
+                                burst_number: Some(state.burst_number),
                                 color,
                                 depth,
                                 motion_vectors,
@@ -201,8 +202,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                             };
 
                             info!(
-                                "recording: stop-drain burst idx={} frame={} (deferred)",
-                                idx, state.frame_number
+                                "recording: stop-drain burst idx={} frame={} burst={} (deferred)",
+                                idx, state.frame_number, state.burst_number
                             );
 
                             if let Ok(()) = state
@@ -271,6 +272,9 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
 
         // Reset burst state at cycle start
         if pos == 0 {
+            if state.burst_captured > 0 {
+                state.burst_number += 1;
+            }
             state.burst_captured = 0;
             state.burst_drain_idx = 0;
             for m in state.burst_metadata.iter_mut() {
@@ -351,6 +355,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             let packet = DeferredFramePacket {
                 frame_number: state.frame_number,
                 estimated_bytes,
+                burst_number: Some(state.burst_number),
                 color,
                 depth,
                 motion_vectors,
@@ -358,8 +363,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             };
 
             info!(
-                "recording: burst drain idx={} frame={} (deferred)",
-                idx, state.frame_number
+                "recording: burst drain idx={} frame={} burst={} (deferred)",
+                idx, state.frame_number, state.burst_number
             );
 
             match state
@@ -455,6 +460,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     let packet = FramePacket {
         frame_number: state.frame_number,
         packet_bytes,
+        burst_number: None,
         color,
         depth,
         motion_vectors,

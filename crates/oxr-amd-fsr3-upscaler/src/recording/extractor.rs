@@ -15,6 +15,8 @@ pub struct DeferredFramePacket {
     pub frame_number: u64,
     /// Estimated raw bytes (from BufferInfo: width * height * bpp/8 per slot).
     pub estimated_bytes: u64,
+    /// Burst number for Burst8 mode (None for non-burst modes).
+    pub burst_number: Option<u64>,
     pub color: Option<DeferredTextureData>,
     pub depth: Option<DeferredTextureData>,
     pub motion_vectors: Option<DeferredTextureData>,
@@ -88,6 +90,7 @@ fn extractor_loop(rx: &mpsc::Receiver<ExtractorMessage>, writer_tx: &mpsc::Sende
                 let packet = FramePacket {
                     frame_number,
                     packet_bytes,
+                    burst_number: deferred.burst_number,
                     color,
                     depth,
                     motion_vectors,
