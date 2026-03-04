@@ -155,6 +155,11 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             state.stride_counter += 1;
             return;
         }
+        stride::Stride::Burst8 if stride::should_skip_burst(state.stride_counter) => {
+            state.skip_this_frame = true;
+            state.stride_counter += 1;
+            return;
+        }
         _ => {
             state.skip_this_frame = false;
             state.stride_counter += 1;

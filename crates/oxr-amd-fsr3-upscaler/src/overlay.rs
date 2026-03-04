@@ -123,7 +123,7 @@ pub unsafe fn render_frame(
             ui.push_style_color(imgui::StyleColor::TitleBgActive, [0.3, 0.3, 0.3, 1.0]);
 
         ui.window("Upscaler")
-            .size([300.0, 0.0], Condition::Always)
+            .size([0.0, 0.0], Condition::Always)
             .position([60.0, 400.0], Condition::Always)
             .flags(imgui::WindowFlags::NO_MOUSE_INPUTS)
             .build(|| {
@@ -201,6 +201,11 @@ pub unsafe fn render_frame(
                     }
                     ui.same_line();
                     if ui.radio_button("Every 2nd", &mut current_stride, Stride::EverySecond) {
+                        stride::set(current_stride);
+                        info!("overlay: stride={:?}", current_stride);
+                    }
+                    ui.same_line();
+                    if ui.radio_button("Burst 8/3s", &mut current_stride, Stride::Burst8) {
                         stride::set(current_stride);
                         info!("overlay: stride={:?}", current_stride);
                     }
