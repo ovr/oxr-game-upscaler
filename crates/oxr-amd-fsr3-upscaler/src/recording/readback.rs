@@ -27,7 +27,7 @@ pub enum Slot {
 }
 
 const NUM_SLOTS: usize = 3;
-const NUM_PARITY: usize = 4;
+const NUM_PARITY: usize = 8;
 
 /// Info about a readback buffer's layout.
 #[derive(Clone, Debug)]
@@ -39,7 +39,7 @@ pub struct BufferInfo {
     pub bpp: u32,
 }
 
-/// Quad-buffered readback pool: 3 slots × 4 parities (3 frames of GPU latency).
+/// Readback pool: 3 slots × 8 parities (4 for normal, 8 for Burst8 mode).
 pub struct ReadbackPool {
     buffers: [[Option<ID3D12Resource>; NUM_PARITY]; NUM_SLOTS],
     infos: [[Option<BufferInfo>; NUM_PARITY]; NUM_SLOTS],
@@ -414,6 +414,63 @@ pub fn is_depth_stencil_format(format: DXGI_FORMAT) -> bool {
             | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
             | DXGI_FORMAT_X24_TYPELESS_G8_UINT
     )
+}
+
+/// COM-refcounted handle for deferred readback on the writer thread.
+/// Clones (AddRef's) the ID3D12Resource so the pool can be dropped independently.
+pub struct DeferredReadback {
+    pub resource: ID3D12Resource,
+    pub info: BufferInfo,
+}
+
+// ID3D12Resource is Send (free-threaded COM object).
+unsafe impl Send for DeferredReadback {}
+
+/// Standalone Map/memcpy/Unmap — same logic as `ReadbackPool::map_and_extract`
+/// but operates on a lone COM resource with no pool reference needed.
+///
+/// # Safety
+/// The resource must be a READBACK heap buffer that the GPU has finished writing to.
+pub unsafe fn extract_from_resource(rb: &DeferredReadback) -> Option<Vec<u8>> {
+    let info = &rb.info;
+    let row_bytes = (info.width * info.bpp / 8) as usize;
+    let total_bytes = row_bytes * info.height as usize;
+
+    let mut mapped: *mut u8 = std::ptr::null_mut();
+    if let Err(e) = rb
+        .resource
+        .Map(0, None, Some(&mut mapped as *mut *mut u8 as *mut *mut _))
+    {
+        error!("deferred readback: Map failed: {}", e);
+        return None;
+    }
+
+    let mut data = Vec::with_capacity(total_bytes);
+    if info.row_pitch as usize == row_bytes {
+        std::ptr::copy_nonoverlapping(mapped, data.as_mut_ptr(), total_bytes);
+    } else {
+        for row in 0..info.height as usize {
+            let src = mapped.add(row * info.row_pitch as usize);
+            let dst = data.as_mut_ptr().add(row * row_bytes);
+            std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+        }
+    }
+    data.set_len(total_bytes);
+
+    rb.resource.Unmap(0, None);
+    Some(data)
+}
+
+impl ReadbackPool {
+    /// Clone (AddRef) the COM resource + BufferInfo for deferred readback on the writer thread.
+    /// No Map call — the actual CPU readback happens later on the writer thread.
+    pub fn get_deferred_readback(&self, slot: Slot, parity: usize) -> Option<DeferredReadback> {
+        let s = slot as usize;
+        let p = parity;
+        let resource = self.buffers[s][p].as_ref()?.clone(); // AddRef
+        let info = self.infos[s][p].as_ref()?.clone();
+        Some(DeferredReadback { resource, info })
+    }
 }
 
 fn align_up(value: u32, alignment: u32) -> u32 {

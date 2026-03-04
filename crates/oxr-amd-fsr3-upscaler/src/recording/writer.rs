@@ -35,6 +35,7 @@ pub struct TextureData {
 }
 
 /// Per-frame metadata from the dispatch descriptor.
+#[derive(Clone)]
 pub struct FrameMetadata {
     pub jitter_x: f32,
     pub jitter_y: f32,
@@ -396,10 +397,7 @@ fn convert_to_r_f32(tex: &TextureData) -> Vec<f32> {
         DXGI_FORMAT_R16_FLOAT | DXGI_FORMAT_R16_TYPELESS => {
             // Reinterpret &[u8] as &[f16], then batch-convert with SIMD (F16C)
             let src = unsafe {
-                std::slice::from_raw_parts(
-                    tex.data.as_ptr() as *const half::f16,
-                    pixel_count,
-                )
+                std::slice::from_raw_parts(tex.data.as_ptr() as *const half::f16, pixel_count)
             };
             src.convert_to_f32_slice(&mut out);
         }
@@ -446,10 +444,7 @@ fn convert_to_rg_f32(tex: &TextureData) -> Vec<f32> {
         DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_TYPELESS => {
             // Interleaved RG16F → interleaved RG32F: batch f16→f32 with SIMD (F16C)
             let src = unsafe {
-                std::slice::from_raw_parts(
-                    tex.data.as_ptr() as *const half::f16,
-                    pixel_count * 2,
-                )
+                std::slice::from_raw_parts(tex.data.as_ptr() as *const half::f16, pixel_count * 2)
             };
             src.convert_to_f32_slice(&mut out);
         }

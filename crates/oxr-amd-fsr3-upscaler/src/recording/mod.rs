@@ -1,3 +1,4 @@
+mod extractor;
 mod readback;
 pub mod stride;
 mod writer;
@@ -17,6 +18,7 @@ use crate::dispatch;
 use crate::fsr3_types::FfxFsr3UpscalerDispatchDescription;
 use crate::logging;
 
+use extractor::{estimate_slot_bytes, DeferredFramePacket, DeferredTextureData, ExtractorMessage};
 use readback::{is_depth_stencil_format, ReadbackPool, Slot};
 use writer::{FrameMetadata, FramePacket, TextureData, WriterMessage};
 
@@ -34,6 +36,7 @@ static PREV_F10: AtomicBool = AtomicBool::new(false);
 struct RecorderState {
     pool: ReadbackPool,
     sender: std::sync::mpsc::Sender<WriterMessage>,
+    extractor_sender: std::sync::mpsc::SyncSender<ExtractorMessage>,
     _session_dir: PathBuf,
     frame_number: u64,
     parity: usize,
@@ -43,13 +46,20 @@ struct RecorderState {
     /// Monotonic counter written by GPU via WriteBufferImmediate.
     write_counter: u32,
     /// Expected marker value per parity slot (set when GPU write is enqueued).
-    expected_marker: [u32; 4],
+    expected_marker: [u32; 8],
     /// Frame counter for stride logic (increments every dispatch while recording).
     stride_counter: u64,
     /// Set by pre_dispatch when the current frame should be skipped per stride setting.
     skip_this_frame: bool,
     /// Frames remaining before we drop the pool (lets in-flight GPU copies finish).
     drain_frames: u8,
+    // --- Burst8 state ---
+    /// How many frames have been GPU-captured in the current burst (0..=8).
+    burst_captured: u8,
+    /// Next burst frame index to drain via CPU readback (0..burst_captured).
+    burst_drain_idx: u8,
+    /// Saved per-frame metadata for deferred drain.
+    burst_metadata: [Option<FrameMetadata>; 8],
 }
 
 static RECORDER: Mutex<Option<RecorderState>> = Mutex::new(None);
@@ -68,11 +78,23 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     if toggled {
         if RECORDING_ACTIVE.load(Ordering::Relaxed) {
             // Stop recording — defer pool drop to let in-flight GPU copies finish
-            info!("recording: stopping (draining 4 frames)");
             RECORDING_ACTIVE.store(false, Ordering::Relaxed);
             if let Some(state) = guard.as_mut() {
-                let _ = state.sender.send(WriterMessage::Shutdown);
-                state.drain_frames = 4;
+                // If mid-burst, drain remaining captured frames before shutdown
+                let pending_burst = state.burst_captured.saturating_sub(state.burst_drain_idx);
+                if pending_burst > 0 {
+                    // Drain up to 2 per dispatch, so ceil(pending/2) + safety margin
+                    let drain_dispatches = (pending_burst as u8 + 1) / 2 + 2;
+                    info!(
+                        "recording: stopping mid-burst ({} captured, {} drained), draining {} frames",
+                        state.burst_captured, state.burst_drain_idx, drain_dispatches
+                    );
+                    state.drain_frames = drain_dispatches;
+                } else {
+                    info!("recording: stopping (draining 4 frames)");
+                    let _ = state.sender.send(WriterMessage::Shutdown);
+                    state.drain_frames = 4;
+                }
             }
             return;
         } else {
@@ -99,20 +121,25 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             }
 
             let sender = writer::spawn_writer(session_dir.clone());
+            let extractor_sender = extractor::spawn_extractor(sender.clone());
 
             *guard = Some(RecorderState {
                 pool: ReadbackPool::new(),
                 sender,
+                extractor_sender,
                 _session_dir: session_dir.clone(),
                 frame_number: 0,
                 parity: 0,
                 warmup_frames: 3,
                 stalled: false,
                 write_counter: 1,
-                expected_marker: [0; 4],
+                expected_marker: [0; 8],
                 stride_counter: 0,
                 skip_this_frame: false,
                 drain_frames: 0,
+                burst_captured: 0,
+                burst_drain_idx: 0,
+                burst_metadata: Default::default(),
             });
             QUEUED_BYTES.store(0, Ordering::Relaxed);
             QUEUED_FRAMES.store(0, Ordering::Relaxed);
@@ -127,6 +154,77 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         // Drain: keep pool alive for a few frames so in-flight GPU copies complete
         if let Some(state) = guard.as_mut() {
             if state.drain_frames > 0 {
+                // Drain remaining burst frames before final shutdown
+                if state.burst_drain_idx < state.burst_captured {
+                    let mut drained = 0u8;
+                    while state.burst_drain_idx < state.burst_captured && drained < 2 {
+                        let idx = state.burst_drain_idx as usize;
+                        let expected = state.expected_marker[idx];
+                        if expected != 0 {
+                            match state.pool.read_marker(idx) {
+                                Some(marker) if marker == expected => {}
+                                _ => break,
+                            }
+                        }
+
+                        if let Some(metadata) = state.burst_metadata[idx].take() {
+                            let color = state
+                                .pool
+                                .get_deferred_readback(Slot::Color, idx)
+                                .map(|rb| DeferredTextureData { readback: rb });
+                            let depth = state
+                                .pool
+                                .get_deferred_readback(Slot::Depth, idx)
+                                .map(|rb| DeferredTextureData { readback: rb });
+                            let motion_vectors = state
+                                .pool
+                                .get_deferred_readback(Slot::MotionVectors, idx)
+                                .map(|rb| DeferredTextureData { readback: rb });
+
+                            let estimated_bytes = color
+                                .as_ref()
+                                .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
+                                + depth
+                                    .as_ref()
+                                    .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
+                                + motion_vectors
+                                    .as_ref()
+                                    .map_or(0, |d| estimate_slot_bytes(&d.readback.info));
+
+                            let packet = DeferredFramePacket {
+                                frame_number: state.frame_number,
+                                estimated_bytes,
+                                color,
+                                depth,
+                                motion_vectors,
+                                metadata,
+                            };
+
+                            info!(
+                                "recording: stop-drain burst idx={} frame={} (deferred)",
+                                idx, state.frame_number
+                            );
+
+                            if let Ok(()) = state
+                                .extractor_sender
+                                .send(ExtractorMessage::Extract(packet))
+                            {
+                                QUEUED_BYTES.fetch_add(estimated_bytes, Ordering::Relaxed);
+                                QUEUED_FRAMES.fetch_add(1, Ordering::Relaxed);
+                            }
+                            state.frame_number += 1;
+                        }
+                        state.burst_drain_idx += 1;
+                        drained += 1;
+                    }
+
+                    // If all burst frames drained, send shutdown via extractor
+                    if state.burst_drain_idx >= state.burst_captured {
+                        info!("recording: burst drain complete, sending shutdown");
+                        let _ = state.extractor_sender.send(ExtractorMessage::Shutdown);
+                    }
+                }
+
                 state.drain_frames -= 1;
                 if state.drain_frames == 0 {
                     info!("recording: drain complete, leaking pool (GPU safety)");
@@ -150,29 +248,11 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         return;
     }
 
-    // Stride: skip frames based on configured stride
-    match stride::get() {
-        stride::Stride::EverySecond if state.stride_counter % 2 == 1 => {
-            state.skip_this_frame = true;
-            state.stride_counter += 1;
-            return;
-        }
-        stride::Stride::Burst8 if stride::should_skip_burst(state.stride_counter) => {
-            state.skip_this_frame = true;
-            state.stride_counter += 1;
-            return;
-        }
-        _ => {
-            state.skip_this_frame = false;
-            state.stride_counter += 1;
-        }
-    }
-
     // Buffer limit check — stop recording when exceeded
     let queued = QUEUED_BYTES.load(Ordering::Relaxed);
     if queued >= MAX_BUFFER_BYTES {
         info!(
-            "recording: buffer limit reached ({:.1} GiB), stopping (draining 4 frames)",
+            "recording: buffer limit reached ({:.1} GiB), stopping",
             queued as f64 / (1024.0 * 1024.0 * 1024.0)
         );
         RECORDING_ACTIVE.store(false, Ordering::Relaxed);
@@ -183,7 +263,144 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         return;
     }
 
-    let prev_parity = (state.parity + 1) % 4;
+    let current_stride = stride::get();
+
+    // === Burst8 mode: deferred readback ===
+    if current_stride == stride::Stride::Burst8 {
+        let pos = stride::burst_position(state.stride_counter);
+
+        // Reset burst state at cycle start
+        if pos == 0 {
+            state.burst_captured = 0;
+            state.burst_drain_idx = 0;
+            for m in state.burst_metadata.iter_mut() {
+                *m = None;
+            }
+        }
+
+        if pos < stride::BURST_RECORD {
+            // Phase A — Capture: save metadata, let post_dispatch enqueue GPU copy
+            state.burst_metadata[pos as usize] = Some(FrameMetadata {
+                jitter_x: d.jitter_offset.x,
+                jitter_y: d.jitter_offset.y,
+                camera_near: d.camera_near,
+                camera_far: d.camera_far,
+                camera_fov: d.camera_fov_angle_vertical,
+                frame_time_delta: d.frame_time_delta,
+                render_width: d.render_size.width,
+                render_height: d.render_size.height,
+                output_width: d.output.description.width,
+                output_height: d.output.description.height,
+                motion_vector_scale_x: d.motion_vector_scale.x,
+                motion_vector_scale_y: d.motion_vector_scale.y,
+                pre_exposure: d.pre_exposure,
+                view_space_to_meters_factor: d.view_space_to_meters_factor,
+                reset: d.reset,
+            });
+            state.skip_this_frame = false;
+            state.stride_counter += 1;
+            return; // No CPU readback during capture
+        }
+
+        // Phase B — Drain: send deferred readbacks to extractor (up to 2 per dispatch)
+        state.skip_this_frame = true;
+        let mut drained = 0u8;
+        while state.burst_drain_idx < state.burst_captured && drained < 2 {
+            let idx = state.burst_drain_idx as usize;
+
+            // Check GPU marker for this slot
+            let expected = state.expected_marker[idx];
+            if expected != 0 {
+                match state.pool.read_marker(idx) {
+                    Some(marker) if marker == expected => {}
+                    _ => break, // GPU not ready yet, retry next dispatch
+                }
+            }
+
+            let metadata = match state.burst_metadata[idx].take() {
+                Some(m) => m,
+                None => {
+                    state.burst_drain_idx += 1;
+                    continue;
+                }
+            };
+
+            let color = state
+                .pool
+                .get_deferred_readback(Slot::Color, idx)
+                .map(|rb| DeferredTextureData { readback: rb });
+            let depth = state
+                .pool
+                .get_deferred_readback(Slot::Depth, idx)
+                .map(|rb| DeferredTextureData { readback: rb });
+            let motion_vectors = state
+                .pool
+                .get_deferred_readback(Slot::MotionVectors, idx)
+                .map(|rb| DeferredTextureData { readback: rb });
+
+            let estimated_bytes = color
+                .as_ref()
+                .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
+                + depth
+                    .as_ref()
+                    .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
+                + motion_vectors
+                    .as_ref()
+                    .map_or(0, |d| estimate_slot_bytes(&d.readback.info));
+
+            let packet = DeferredFramePacket {
+                frame_number: state.frame_number,
+                estimated_bytes,
+                color,
+                depth,
+                motion_vectors,
+                metadata,
+            };
+
+            info!(
+                "recording: burst drain idx={} frame={} (deferred)",
+                idx, state.frame_number
+            );
+
+            match state
+                .extractor_sender
+                .send(ExtractorMessage::Extract(packet))
+            {
+                Ok(()) => {
+                    QUEUED_BYTES.fetch_add(estimated_bytes, Ordering::Relaxed);
+                    QUEUED_FRAMES.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    error!("recording: extractor channel closed, disabling recording");
+                    RECORDING_ACTIVE.store(false, Ordering::Relaxed);
+                    *guard = None;
+                    return;
+                }
+            }
+
+            state.frame_number += 1;
+            state.burst_drain_idx += 1;
+            drained += 1;
+        }
+
+        state.stride_counter += 1;
+        return;
+    }
+
+    // === Non-burst modes (Disabled / EverySecond) — original readback-per-frame logic ===
+    match current_stride {
+        stride::Stride::EverySecond if state.stride_counter % 2 == 1 => {
+            state.skip_this_frame = true;
+            state.stride_counter += 1;
+            return;
+        }
+        _ => {
+            state.skip_this_frame = false;
+            state.stride_counter += 1;
+        }
+    }
+
+    let prev_parity = (state.parity + 4 - 1) % 4;
 
     // Check GPU completion marker before reading back
     let expected = state.expected_marker[prev_parity];
@@ -193,8 +410,6 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 state.stalled = false;
             }
             Some(_) | None => {
-                // GPU hasn't finished yet — stall: don't read, don't enqueue new copies.
-                // Next dispatch will retry the same slot.
                 state.stalled = true;
                 return;
             }
@@ -309,7 +524,12 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         None => return,
     };
 
-    let parity = state.parity;
+    let is_burst = stride::get() == stride::Stride::Burst8;
+    let parity = if is_burst {
+        state.burst_captured as usize
+    } else {
+        state.parity
+    };
 
     // Helper: borrow resource, get its real D3D12 dims+format, ensure readback buffer, enqueue copy
     let mut copy_slot =
@@ -343,11 +563,10 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                     .pool
                     .ensure_buffer(&device, slot, parity, copy_w, copy_h, desc.Format)
                 {
-                    info!("recording: enqueue_copy {:?}", slot);
+                    info!("recording: enqueue_copy {:?}[{}]", slot, parity);
                     state
                         .pool
                         .enqueue_copy(&cmd_list, slot, parity, &res, ffx_state);
-                    info!("recording: enqueue_copy {:?} done", slot);
                 }
             }
         };
@@ -411,6 +630,10 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         }
     }
 
-    // Advance parity for next frame
-    state.parity = (state.parity + 1) % 4;
+    // Advance parity / burst counter
+    if is_burst {
+        state.burst_captured += 1;
+    } else {
+        state.parity = (state.parity + 1) % 4;
+    }
 }

@@ -10,12 +10,13 @@ pub enum Stride {
 
 /// Burst8: record 8 frames, skip for ~3 seconds.
 /// At 60fps, 3s ≈ 180 frames. Total cycle = 8 + 180 = 188.
-const BURST_RECORD: u64 = 8;
+pub const BURST_RECORD: u64 = 8;
 const BURST_SKIP: u64 = 180;
 const BURST_CYCLE: u64 = BURST_RECORD + BURST_SKIP;
 
-pub fn should_skip_burst(stride_counter: u64) -> bool {
-    (stride_counter % BURST_CYCLE) >= BURST_RECORD
+/// Position within the current burst cycle (0..BURST_CYCLE-1).
+pub fn burst_position(stride_counter: u64) -> u64 {
+    stride_counter % BURST_CYCLE
 }
 
 static STRIDE: AtomicU8 = AtomicU8::new(Stride::Burst8 as u8);
