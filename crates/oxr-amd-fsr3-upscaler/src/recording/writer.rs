@@ -137,6 +137,7 @@ fn writer_loop(rx: &mpsc::Receiver<WriterMessage>, session_dir: &PathBuf) {
                 }
                 drop(packet);
                 super::QUEUED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+                super::QUEUED_FRAMES.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }

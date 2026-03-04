@@ -191,6 +191,9 @@ pub unsafe fn render_frame(
                     let max_gib = recording::MAX_BUFFER_BYTES as f64 / (1024.0 * 1024.0 * 1024.0);
                     ui.text(format!("{:.1} / {:.1} GiB", used_gib, max_gib));
 
+                    let frames = recording::QUEUED_FRAMES.load(Ordering::Relaxed);
+                    ui.text(format!("{} frames", frames));
+
                     // Stride selector
                     use recording::stride::{self, Stride};
                     let mut current_stride = stride::get();

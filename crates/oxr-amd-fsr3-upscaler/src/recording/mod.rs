@@ -27,6 +27,7 @@ pub(crate) const MAX_BUFFER_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 
 pub(crate) static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub(crate) static QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static QUEUED_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// Persists across start/stop so we don't lose rising-edge state when RecorderState is dropped.
 static PREV_F10: AtomicBool = AtomicBool::new(false);
 
@@ -69,7 +70,6 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             // Stop recording — defer pool drop to let in-flight GPU copies finish
             info!("recording: stopping (draining 4 frames)");
             RECORDING_ACTIVE.store(false, Ordering::Relaxed);
-            QUEUED_BYTES.store(0, Ordering::Relaxed);
             if let Some(state) = guard.as_mut() {
                 let _ = state.sender.send(WriterMessage::Shutdown);
                 state.drain_frames = 4;
@@ -114,6 +114,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 skip_this_frame: false,
                 drain_frames: 0,
             });
+            QUEUED_BYTES.store(0, Ordering::Relaxed);
+            QUEUED_FRAMES.store(0, Ordering::Relaxed);
             RECORDING_ACTIVE.store(true, Ordering::Relaxed);
             info!("recording: started → {}", session_dir.display());
             return;
@@ -247,6 +249,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     match state.sender.send(WriterMessage::Frame(packet)) {
         Ok(()) => {
             QUEUED_BYTES.fetch_add(packet_bytes, Ordering::Relaxed);
+            QUEUED_FRAMES.fetch_add(1, Ordering::Relaxed);
         }
         Err(_) => {
             error!("recording: writer channel closed, disabling recording");
