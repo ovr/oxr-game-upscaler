@@ -38,6 +38,7 @@ optional = true
 
 [dependencies.half]
 version = "2"
+features = ["use-intrinsics"]
 optional = true
 
 [dependencies.smallvec]

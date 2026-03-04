@@ -353,21 +353,22 @@ fn convert_to_rgba_f32(tex: &TextureData) -> Vec<f32> {
 
 /// Convert raw texture data to single-channel f32 (depth).
 fn convert_to_r_f32(tex: &TextureData) -> Vec<f32> {
+    use half::slice::HalfFloatSliceExt;
+
     let w = tex.info.width as usize;
     let h = tex.info.height as usize;
     let pixel_count = w * h;
-    let mut out = vec![0.0f32; pixel_count];
+    let mut out = unsafe { vec_uninit::<f32>(pixel_count) };
 
     match tex.info.dxgi_format {
         DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT => {
-            for i in 0..pixel_count {
-                let offset = i * 4;
-                out[i] = f32::from_le_bytes([
-                    tex.data[offset],
-                    tex.data[offset + 1],
-                    tex.data[offset + 2],
-                    tex.data[offset + 3],
-                ]);
+            // x86 LE: raw bytes are already f32 layout — single memcpy
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tex.data.as_ptr(),
+                    out.as_mut_ptr() as *mut u8,
+                    pixel_count * 4,
+                );
             }
         }
         // 24-bit unorm depth + 8-bit stencil packed in 32 bits
@@ -388,11 +389,14 @@ fn convert_to_r_f32(tex: &TextureData) -> Vec<f32> {
             }
         }
         DXGI_FORMAT_R16_FLOAT | DXGI_FORMAT_R16_TYPELESS => {
-            for i in 0..pixel_count {
-                let offset = i * 2;
-                let bits = u16::from_le_bytes([tex.data[offset], tex.data[offset + 1]]);
-                out[i] = half::f16::from_bits(bits).to_f32();
-            }
+            // Reinterpret &[u8] as &[f16], then batch-convert with SIMD (F16C)
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    tex.data.as_ptr() as *const half::f16,
+                    pixel_count,
+                )
+            };
+            src.convert_to_f32_slice(&mut out);
         }
         DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_D16_UNORM => {
             for i in 0..pixel_count {
@@ -402,7 +406,7 @@ fn convert_to_r_f32(tex: &TextureData) -> Vec<f32> {
             }
         }
         DXGI_FORMAT_R32G32_FLOAT | DXGI_FORMAT_R32G32_TYPELESS => {
-            // 8 bytes per pixel (2 × f32), take first R32 as depth
+            // 8 bytes per pixel (2 × f32), take first R32 as depth (strided read)
             for i in 0..pixel_count {
                 let offset = i * 8;
                 out[i] = f32::from_le_bytes([
@@ -418,6 +422,7 @@ fn convert_to_r_f32(tex: &TextureData) -> Vec<f32> {
                 "writer: unsupported depth format {:?}, filling zeros",
                 tex.info.dxgi_format
             );
+            out.fill(0.0);
         }
     }
     out
@@ -425,37 +430,32 @@ fn convert_to_r_f32(tex: &TextureData) -> Vec<f32> {
 
 /// Convert raw texture data to 2-channel f32 (motion vectors).
 fn convert_to_rg_f32(tex: &TextureData) -> Vec<f32> {
+    use half::slice::HalfFloatSliceExt;
+
     let w = tex.info.width as usize;
     let h = tex.info.height as usize;
     let pixel_count = w * h;
-    let mut out = vec![0.0f32; pixel_count * 2];
+    let mut out = unsafe { vec_uninit::<f32>(pixel_count * 2) };
 
     match tex.info.dxgi_format {
         DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_TYPELESS => {
-            // 4 bytes per pixel, 2 × f16
-            for i in 0..pixel_count {
-                let offset = i * 4;
-                for c in 0..2 {
-                    let bits = u16::from_le_bytes([
-                        tex.data[offset + c * 2],
-                        tex.data[offset + c * 2 + 1],
-                    ]);
-                    out[i * 2 + c] = half::f16::from_bits(bits).to_f32();
-                }
-            }
+            // Interleaved RG16F → interleaved RG32F: batch f16→f32 with SIMD (F16C)
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    tex.data.as_ptr() as *const half::f16,
+                    pixel_count * 2,
+                )
+            };
+            src.convert_to_f32_slice(&mut out);
         }
         DXGI_FORMAT_R32G32_FLOAT | DXGI_FORMAT_R32G32_TYPELESS => {
-            // 8 bytes per pixel, 2 × f32
-            for i in 0..pixel_count {
-                let offset = i * 8;
-                for c in 0..2 {
-                    out[i * 2 + c] = f32::from_le_bytes([
-                        tex.data[offset + c * 4],
-                        tex.data[offset + c * 4 + 1],
-                        tex.data[offset + c * 4 + 2],
-                        tex.data[offset + c * 4 + 3],
-                    ]);
-                }
+            // x86 LE: interleaved RG32F = identical layout — single memcpy
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tex.data.as_ptr(),
+                    out.as_mut_ptr() as *mut u8,
+                    pixel_count * 8,
+                );
             }
         }
         _ => {
@@ -463,6 +463,7 @@ fn convert_to_rg_f32(tex: &TextureData) -> Vec<f32> {
                 "writer: unsupported mv format {:?}, filling zeros",
                 tex.info.dxgi_format
             );
+            out.fill(0.0);
         }
     }
     out
