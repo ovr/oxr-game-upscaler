@@ -4,6 +4,7 @@ use crate::fsr3_types::*;
 use crate::gpu_pipeline::{self, GpuState};
 use crate::overlay;
 use crate::sgsr2_state;
+use crate::sgsr2_three_pass_state;
 use crate::upscaler_type;
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -228,8 +229,21 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
 
     // --- SGSRv2 temporal upscaler: separate multi-pass path ---
     let current_upscaler = upscaler_type::get();
+    if current_upscaler == upscaler_type::UpscalerType::SGSRv2TwoPass {
+        return dispatch_sgsr2_two_pass(
+            &cmd_list,
+            gpu,
+            d,
+            &color_res,
+            &output_res,
+            render_w,
+            render_h,
+            output_w,
+            output_h,
+        );
+    }
     if current_upscaler == upscaler_type::UpscalerType::SGSRv2 {
-        return dispatch_sgsr2(
+        return dispatch_sgsr2_three_pass(
             &cmd_list,
             gpu,
             d,
@@ -279,7 +293,9 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
         upscaler_type::UpscalerType::Bilinear => &gpu.pso_bilinear,
         upscaler_type::UpscalerType::Lanczos => &gpu.pso_lanczos,
         upscaler_type::UpscalerType::SGSR => &gpu.pso_sgsr,
-        upscaler_type::UpscalerType::SGSRv2 => unreachable!("SGSRv2 handled above"),
+        upscaler_type::UpscalerType::SGSRv2TwoPass | upscaler_type::UpscalerType::SGSRv2 => {
+            unreachable!("SGSRv2 handled above")
+        }
     };
 
     // --- Viewport + scissor (shared by both passes) ---
@@ -496,7 +512,7 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
 
 /// SGSRv2 temporal upscaler: 2-pass dispatch (convert + upscale) with history ping-pong.
 #[allow(clippy::too_many_arguments)]
-unsafe fn dispatch_sgsr2(
+unsafe fn dispatch_sgsr2_two_pass(
     cmd_list: &ID3D12GraphicsCommandList,
     gpu: &GpuState,
     d: &FfxFsr3UpscalerDispatchDescription,
@@ -941,7 +957,619 @@ unsafe fn dispatch_sgsr2(
         prev_idx = prev_idx,
         curr_idx = curr_idx,
         d_reset = d.reset,
-        "SGSRv2 temporal upscale (2-pass)"
+        "SGSRv2 temporal upscale (2-pass, two_pass)"
+    );
+
+    0 // FFX_OK
+}
+
+/// SGSRv2 temporal upscaler: 3-pass dispatch (convert + activate + upscale) with history ping-pong.
+#[allow(clippy::too_many_arguments)]
+unsafe fn dispatch_sgsr2_three_pass(
+    cmd_list: &ID3D12GraphicsCommandList,
+    gpu: &GpuState,
+    d: &FfxFsr3UpscalerDispatchDescription,
+    color_res: &ID3D12Resource,
+    output_res: &ID3D12Resource,
+    render_w: u32,
+    render_h: u32,
+    output_w: u32,
+    output_h: u32,
+) -> u32 {
+    // Get/create persistent 3-pass state
+    let mut state_guard = match sgsr2_three_pass_state::get_or_create(
+        &gpu.device,
+        render_w,
+        render_h,
+        output_w,
+        output_h,
+        gpu.rt_format,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            error!("dispatch_sgsr2_3pass: state creation failed: {}", e);
+            return 1;
+        }
+    };
+    let state = state_guard.as_mut().unwrap();
+
+    let is_reset = d.reset || !state.initialized;
+
+    // Borrow depth and motion_vectors resources
+    let depth_res = match borrow_resource(d.depth.resource) {
+        Some(r) => r,
+        None => {
+            error!("dispatch_sgsr2_3pass: null depth resource");
+            return 1;
+        }
+    };
+    let mv_res = match borrow_resource(d.motion_vectors.resource) {
+        Some(r) => r,
+        None => {
+            error!("dispatch_sgsr2_3pass: null motion_vectors resource");
+            return 1;
+        }
+    };
+
+    // Build root constants (32 DWORDs) — same layout as 2-pass but bSameCamera → preExposure
+    let scale_ratio_x = output_w as f32 / render_w as f32;
+    let scale_ratio_y = output_h as f32 / render_h as f32;
+    let render_size_rcp_x = 1.0 / render_w as f32;
+    let render_size_rcp_y = 1.0 / render_h as f32;
+    let output_size_rcp_x = 1.0 / output_w as f32;
+    let output_size_rcp_y = 1.0 / output_h as f32;
+
+    let root_constants: [u32; 32] = [
+        // clipToPrevClip[0] = col0
+        1.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        // clipToPrevClip[1] = col1
+        0.0_f32.to_bits(),
+        1.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        // clipToPrevClip[2] = col2
+        0.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        1.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        // clipToPrevClip[3] = col3
+        0.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        0.0_f32.to_bits(),
+        1.0_f32.to_bits(),
+        // renderSize
+        (render_w as f32).to_bits(),
+        (render_h as f32).to_bits(),
+        // outputSize
+        (output_w as f32).to_bits(),
+        (output_h as f32).to_bits(),
+        // renderSizeRcp
+        render_size_rcp_x.to_bits(),
+        render_size_rcp_y.to_bits(),
+        // outputSizeRcp
+        output_size_rcp_x.to_bits(),
+        output_size_rcp_y.to_bits(),
+        // jitterOffset
+        d.jitter_offset.x.to_bits(),
+        d.jitter_offset.y.to_bits(),
+        // scaleRatio
+        scale_ratio_x.to_bits(),
+        scale_ratio_y.to_bits(),
+        // cameraFovAngleHor
+        (d.camera_fov_angle_vertical * 16.0 / 9.0).to_bits(),
+        // minLerpContribution
+        0.25_f32.to_bits(),
+        // reset (ValidReset)
+        (if is_reset { 1.0_f32 } else { 0.0_f32 }).to_bits(),
+        // preExposure (replaces bSameCamera)
+        d.pre_exposure.to_bits(),
+    ];
+
+    let prev_idx = state.frame_idx as usize;
+    let curr_idx = 1 - prev_idx;
+
+    // ============================================================
+    // Pass 1: Convert (render resolution)
+    // Input: depth, velocity, color → Output: ycocg (R32_UINT), motion_depth_alpha (R16G16B16A16_FLOAT)
+    // ============================================================
+    {
+        let mut barriers = Vec::new();
+        if let Some(b) = resource_barrier_transition(
+            &depth_res,
+            d.depth.state,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition(
+            &mv_res,
+            d.motion_vectors.state,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition(
+            color_res,
+            d.color.state,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.ycocg_color,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.motion_depth_alpha,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ) {
+            barriers.push(b);
+        }
+        if !barriers.is_empty() {
+            cmd_list.ResourceBarrier(&barriers);
+        }
+    }
+
+    // SRVs for convert: depth (slot 15), velocity (slot 16), color (slot 17)
+    create_typed_srv(gpu, &depth_res, d.depth.description.format, 15);
+    create_typed_srv(gpu, &mv_res, d.motion_vectors.description.format, 16);
+    create_typed_srv(gpu, color_res, d.color.description.format, 17);
+
+    // RTVs for convert: ycocg (slot 4), motion_depth_alpha (slot 5)
+    {
+        let rtv_desc_uint = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_RTV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        };
+        gpu.device.CreateRenderTargetView(
+            &state.ycocg_color,
+            Some(&rtv_desc_uint),
+            gpu_pipeline::get_rtv_cpu_handle(gpu, 4),
+        );
+    }
+    gpu.device.CreateRenderTargetView(
+        &state.motion_depth_alpha,
+        None,
+        gpu_pipeline::get_rtv_cpu_handle(gpu, 5),
+    );
+
+    // Set pipeline for convert pass
+    cmd_list.SetGraphicsRootSignature(&gpu.sgsr2_3pass_root_signature);
+    cmd_list.SetPipelineState(&gpu.pso_sgsr2_3p_convert);
+    cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
+    cmd_list.SetGraphicsRoot32BitConstants(
+        0,
+        root_constants.len() as u32,
+        root_constants.as_ptr() as *const core::ffi::c_void,
+        0,
+    );
+    // SRV table: slots 15-17 (depth, velocity, color)
+    cmd_list.SetGraphicsRootDescriptorTable(1, gpu_pipeline::get_srv_gpu_handle(gpu, 15));
+
+    let render_viewport = D3D12_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: render_w as f32,
+        Height: render_h as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    let render_scissor = windows::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: render_w as i32,
+        bottom: render_h as i32,
+    };
+    cmd_list.RSSetViewports(&[render_viewport]);
+    cmd_list.RSSetScissorRects(&[render_scissor]);
+
+    // MRT: 2 render targets
+    let rtv0 = gpu_pipeline::get_rtv_cpu_handle(gpu, 4);
+    let rtv1 = gpu_pipeline::get_rtv_cpu_handle(gpu, 5);
+    let rtvs = [rtv0, rtv1];
+    cmd_list.OMSetRenderTargets(2, Some(rtvs.as_ptr()), false, None);
+
+    cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd_list.DrawInstanced(3, 1, 0, 0);
+
+    // ============================================================
+    // Pass 2: Activate (render resolution)
+    // Input: ycocg, motion_depth_alpha, prev_luma_history → Output: motion_depth_clip_alpha, luma_history[curr]
+    // ============================================================
+    {
+        let mut barriers = Vec::new();
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.ycocg_color,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.motion_depth_alpha,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.motion_depth_clip_alpha,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.luma_history[curr_idx],
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ) {
+            barriers.push(b);
+        }
+        if !barriers.is_empty() {
+            cmd_list.ResourceBarrier(&barriers);
+        }
+    }
+
+    // SRVs for activate: ycocg (slot 18), mda (slot 19), prev_luma (slot 20)
+    {
+        let srv_uint = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        gpu.device.CreateShaderResourceView(
+            &state.ycocg_color,
+            Some(&srv_uint),
+            gpu_pipeline::get_srv_cpu_handle(gpu, 18),
+        );
+
+        let srv_float = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        gpu.device.CreateShaderResourceView(
+            &state.motion_depth_alpha,
+            Some(&srv_float),
+            gpu_pipeline::get_srv_cpu_handle(gpu, 19),
+        );
+
+        gpu.device.CreateShaderResourceView(
+            &state.luma_history[prev_idx],
+            Some(&srv_uint),
+            gpu_pipeline::get_srv_cpu_handle(gpu, 20),
+        );
+    }
+
+    // RTVs for activate: motion_depth_clip_alpha (slot 6), luma_history[curr] (slot 7)
+    gpu.device.CreateRenderTargetView(
+        &state.motion_depth_clip_alpha,
+        None,
+        gpu_pipeline::get_rtv_cpu_handle(gpu, 6),
+    );
+    {
+        let rtv_desc_uint = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_RTV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        };
+        gpu.device.CreateRenderTargetView(
+            &state.luma_history[curr_idx],
+            Some(&rtv_desc_uint),
+            gpu_pipeline::get_rtv_cpu_handle(gpu, 7),
+        );
+    }
+
+    cmd_list.SetPipelineState(&gpu.pso_sgsr2_3p_activate);
+    // SRV table: slots 18-20
+    cmd_list.SetGraphicsRootDescriptorTable(1, gpu_pipeline::get_srv_gpu_handle(gpu, 18));
+
+    cmd_list.RSSetViewports(&[render_viewport]);
+    cmd_list.RSSetScissorRects(&[render_scissor]);
+
+    let act_rtv0 = gpu_pipeline::get_rtv_cpu_handle(gpu, 6);
+    let act_rtv1 = gpu_pipeline::get_rtv_cpu_handle(gpu, 7);
+    let act_rtvs = [act_rtv0, act_rtv1];
+    cmd_list.OMSetRenderTargets(2, Some(act_rtvs.as_ptr()), false, None);
+
+    cmd_list.DrawInstanced(3, 1, 0, 0);
+
+    // ============================================================
+    // Pass 3: Upscale (display resolution)
+    // Input: prev_history, motion_depth_clip_alpha, ycocg → Output: history[curr]
+    // ============================================================
+    {
+        let mut barriers = Vec::new();
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.motion_depth_clip_alpha,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.luma_history[curr_idx],
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        // ycocg_color is already SRV from after activate barriers
+        // history[curr] → RT
+        if is_reset {
+            // Clear both history buffers on reset
+            if let Some(b) = resource_barrier_transition_d3d12(
+                &state.history[prev_idx],
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ) {
+                barriers.push(b);
+            }
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.history[curr_idx],
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ) {
+            barriers.push(b);
+        }
+        if !barriers.is_empty() {
+            cmd_list.ResourceBarrier(&barriers);
+        }
+    }
+
+    // Clear history on reset
+    if is_reset {
+        let black = [0.0_f32, 0.0, 0.0, 0.0];
+        for idx in [prev_idx, curr_idx] {
+            gpu.device.CreateRenderTargetView(
+                &state.history[idx],
+                None,
+                gpu_pipeline::get_rtv_cpu_handle(gpu, 9),
+            );
+            cmd_list.ClearRenderTargetView(gpu_pipeline::get_rtv_cpu_handle(gpu, 9), &black, None);
+        }
+        // Transition prev history back to SRV
+        let mut barriers = Vec::new();
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.history[prev_idx],
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if !barriers.is_empty() {
+            cmd_list.ResourceBarrier(&barriers);
+        }
+    }
+
+    // SRVs for upscale: prev_history (slot 21), mdca (slot 22), ycocg (slot 23)
+    {
+        let srv_history = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        gpu.device.CreateShaderResourceView(
+            &state.history[prev_idx],
+            Some(&srv_history),
+            gpu_pipeline::get_srv_cpu_handle(gpu, 21),
+        );
+
+        let srv_float = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        gpu.device.CreateShaderResourceView(
+            &state.motion_depth_clip_alpha,
+            Some(&srv_float),
+            gpu_pipeline::get_srv_cpu_handle(gpu, 22),
+        );
+
+        let srv_uint = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        gpu.device.CreateShaderResourceView(
+            &state.ycocg_color,
+            Some(&srv_uint),
+            gpu_pipeline::get_srv_cpu_handle(gpu, 23),
+        );
+    }
+
+    // RTVs for upscale MRT: history[curr] (slot 8), output (slot 9)
+    gpu.device.CreateRenderTargetView(
+        &state.history[curr_idx],
+        None,
+        gpu_pipeline::get_rtv_cpu_handle(gpu, 8),
+    );
+    gpu.device
+        .CreateRenderTargetView(output_res, None, gpu_pipeline::get_rtv_cpu_handle(gpu, 9));
+
+    // Barrier: output_res → RENDER_TARGET for MRT
+    {
+        let mut barriers = Vec::new();
+        if let Some(b) = resource_barrier_transition(
+            output_res,
+            d.output.state,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ) {
+            barriers.push(b);
+        }
+        if !barriers.is_empty() {
+            cmd_list.ResourceBarrier(&barriers);
+        }
+    }
+
+    cmd_list.SetPipelineState(&gpu.pso_sgsr2_3p_upscale);
+    // SRV table: slots 21-23
+    cmd_list.SetGraphicsRootDescriptorTable(1, gpu_pipeline::get_srv_gpu_handle(gpu, 21));
+
+    let upscale_viewport = D3D12_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: output_w as f32,
+        Height: output_h as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    let upscale_scissor = windows::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: output_w as i32,
+        bottom: output_h as i32,
+    };
+    cmd_list.RSSetViewports(&[upscale_viewport]);
+    cmd_list.RSSetScissorRects(&[upscale_scissor]);
+
+    // MRT: RT0 = history[curr], RT1 = output
+    let rtv0 = gpu_pipeline::get_rtv_cpu_handle(gpu, 8);
+    let rtv1 = gpu_pipeline::get_rtv_cpu_handle(gpu, 9);
+    let up_rtvs = [rtv0, rtv1];
+    cmd_list.OMSetRenderTargets(2, Some(up_rtvs.as_ptr()), false, None);
+
+    cmd_list.DrawInstanced(3, 1, 0, 0);
+
+    // ============================================================
+    // Post-upscale: render overlay on output, restore barriers
+    // (No CopyResource needed — upscale MRT wrote directly to output via SV_Target1)
+    // ============================================================
+
+    // history[curr]: RENDER_TARGET → SRV for next frame
+    {
+        let mut barriers = Vec::new();
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &state.history[curr_idx],
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ) {
+            barriers.push(b);
+        }
+        if !barriers.is_empty() {
+            cmd_list.ResourceBarrier(&barriers);
+        }
+    }
+
+    // output_res is already RENDER_TARGET from MRT — render overlay on it
+    gpu.device
+        .CreateRenderTargetView(output_res, None, gpu_pipeline::get_rtv_cpu_handle(gpu, 0));
+    cmd_list.RSSetViewports(&[upscale_viewport]);
+    cmd_list.RSSetScissorRects(&[upscale_scissor]);
+    let rtv_output = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
+    cmd_list.OMSetRenderTargets(1, Some(&rtv_output), false, None);
+    overlay::render_frame(cmd_list, gpu, output_w, output_h);
+
+    // Restore all barriers
+    {
+        let mut barriers = Vec::new();
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &depth_res,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ffx_state_to_d3d12(d.depth.state),
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            &mv_res,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ffx_state_to_d3d12(d.motion_vectors.state),
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            color_res,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ffx_state_to_d3d12(d.color.state),
+        ) {
+            barriers.push(b);
+        }
+        if let Some(b) = resource_barrier_transition_d3d12(
+            output_res,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ffx_state_to_d3d12(d.output.state),
+        ) {
+            barriers.push(b);
+        }
+        if !barriers.is_empty() {
+            cmd_list.ResourceBarrier(&barriers);
+        }
+    }
+
+    gpu_pipeline::log_device_removed_reason(&gpu.device);
+
+    // Advance ping-pong (both history and luma_history)
+    state.frame_idx = curr_idx as u32;
+    state.initialized = true;
+
+    info!(
+        render = format_args!("{}x{}", render_w, render_h),
+        output = format_args!("{}x{}", output_w, output_h),
+        reset = is_reset,
+        jitter = format_args!("({:.4}, {:.4})", d.jitter_offset.x, d.jitter_offset.y),
+        frame_idx = state.frame_idx,
+        pre_exposure = d.pre_exposure,
+        "SGSRv2 temporal upscale (3-pass)"
     );
 
     0 // FFX_OK

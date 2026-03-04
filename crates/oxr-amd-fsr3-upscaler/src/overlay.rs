@@ -142,7 +142,11 @@ pub unsafe fn render_frame(
                     upscaler_type::set(active);
                     info!("overlay: switched to {:?}", active);
                 }
-                if ui.radio_button("SGSRv2", &mut active, UpscalerType::SGSRv2) {
+                if ui.radio_button("SGSRv2 (2Pass)", &mut active, UpscalerType::SGSRv2TwoPass) {
+                    upscaler_type::set(active);
+                    info!("overlay: switched to {:?}", active);
+                }
+                if ui.radio_button("SGSRv2 (3Pass)", &mut active, UpscalerType::SGSRv2) {
                     upscaler_type::set(active);
                     info!("overlay: switched to {:?}", active);
                 }
