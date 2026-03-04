@@ -538,44 +538,67 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     };
 
     // Helper: borrow resource, get its real D3D12 dims+format, ensure readback buffer, enqueue copy
-    let mut copy_slot =
-        |slot: Slot, raw: *mut core::ffi::c_void, ffx_state: u32, ffx_w: u32, ffx_h: u32| {
-            if raw.is_null() || ffx_w == 0 || ffx_h == 0 {
+    let mut copy_slot = |slot: Slot,
+                         raw: *mut core::ffi::c_void,
+                         ffx_state: u32,
+                         ffx_w: u32,
+                         ffx_h: u32| {
+        if raw.is_null() {
+            info!("recording: {:?} skipped (null resource)", slot);
+            return;
+        }
+        if let Some(res) = dispatch::borrow_resource(raw) {
+            let desc = res.GetDesc();
+            let actual_w = desc.Width as u32;
+            let actual_h = desc.Height;
+            // Use D3D12 resource dimensions as fallback when FFX description is empty
+            let eff_w = if ffx_w > 0 { ffx_w } else { actual_w };
+            let eff_h = if ffx_h > 0 { ffx_h } else { actual_h };
+            info!(
+                "recording: {:?} ffx={}x{} d3d12={}x{} eff={}x{} fmt={:?} ffx_state=0x{:x}",
+                slot, ffx_w, ffx_h, actual_w, actual_h, eff_w, eff_h, desc.Format, ffx_state
+            );
+            if eff_w == 0 || eff_h == 0 {
+                info!("recording: {:?} skipped (zero dimensions)", slot);
                 return;
             }
-            if let Some(res) = dispatch::borrow_resource(raw) {
-                let desc = res.GetDesc();
-                let actual_w = desc.Width as u32;
-                let actual_h = desc.Height;
-                info!(
-                    "recording: {:?} ffx={}x{} d3d12={}x{} fmt={:?} ffx_state=0x{:x}",
-                    slot, ffx_w, ffx_h, actual_w, actual_h, desc.Format, ffx_state
-                );
-                // Skip depth-stencil multi-plane formats — barrier with ALL_SUBRESOURCES is
-                // unsafe when planes are in different states, causing GPU TDR.
-                if is_depth_stencil_format(desc.Format) {
-                    info!(
-                        "recording: {:?} skipping depth-stencil format {:?}",
-                        slot, desc.Format
-                    );
-                    return;
-                }
-                // Use actual D3D12 resource dimensions — FFX descriptor may report different
-                // sizes (e.g. render region vs texture size). Copy box must not exceed the
-                // actual resource or we get a GPU crash (TDR).
-                let copy_w = ffx_w.min(actual_w);
-                let copy_h = ffx_h.min(actual_h);
+            // Use actual D3D12 resource dimensions — FFX descriptor may report different
+            // sizes (e.g. render region vs texture size). Copy box must not exceed the
+            // actual resource or we get a GPU crash (TDR).
+            let copy_w = eff_w.min(actual_w);
+            let copy_h = eff_h.min(actual_h);
+            // Multi-plane depth-stencil: copy only depth plane (plane 0) as R32_FLOAT.
+            // Per-subresource barriers are needed because planes may be in different states.
+            if is_depth_stencil_format(desc.Format) {
+                let readback_fmt = readback::depth_plane_format(desc.Format);
                 if state
                     .pool
-                    .ensure_buffer(&device, slot, parity, copy_w, copy_h, desc.Format)
+                    .ensure_buffer(&device, slot, parity, copy_w, copy_h, readback_fmt)
                 {
-                    info!("recording: enqueue_copy {:?}[{}]", slot, parity);
-                    state
-                        .pool
-                        .enqueue_copy(&cmd_list, slot, parity, &res, ffx_state);
+                    info!(
+                        "recording: enqueue_copy_depth_plane {:?}[{}] src_fmt={:?} rb_fmt={:?}",
+                        slot, parity, desc.Format, readback_fmt
+                    );
+                    state.pool.enqueue_copy_depth_plane(
+                        &cmd_list,
+                        slot,
+                        parity,
+                        &res,
+                        ffx_state,
+                        desc.Format,
+                    );
                 }
+            } else if state
+                .pool
+                .ensure_buffer(&device, slot, parity, copy_w, copy_h, desc.Format)
+            {
+                info!("recording: enqueue_copy {:?}[{}]", slot, parity);
+                state
+                    .pool
+                    .enqueue_copy(&cmd_list, slot, parity, &res, ffx_state);
             }
-        };
+        }
+    };
 
     // Color (use render_size, not texture size — render region may be smaller)
     let color_w = if d.render_size.width > 0 {

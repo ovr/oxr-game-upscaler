@@ -3,12 +3,13 @@ use tracing::{error, info};
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12Device, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList2, ID3D12Resource, D3D12_BOX,
     D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_READBACK,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
-    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
-    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_COPY_LOCATION,
+    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+    D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
 };
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -318,6 +319,113 @@ impl ReadbackPool {
         }
     }
 
+    /// Enqueue copy of depth plane 0 from a multi-plane depth-stencil resource.
+    /// Uses per-subresource barriers (plane 0 only) to avoid TDR from ALL_SUBRESOURCES
+    /// on resources where depth and stencil planes are in different states.
+    pub unsafe fn enqueue_copy_depth_plane(
+        &self,
+        cmd_list: &ID3D12GraphicsCommandList,
+        slot: Slot,
+        parity: usize,
+        source: &ID3D12Resource,
+        ffx_state: u32,
+        src_format: DXGI_FORMAT,
+    ) {
+        let s = slot as usize;
+        let p = parity;
+
+        let readback = match &self.buffers[s][p] {
+            Some(r) => r,
+            None => return,
+        };
+        let info = match &self.infos[s][p] {
+            Some(i) => i,
+            None => return,
+        };
+
+        let state_before = dispatch::ffx_state_to_d3d12(ffx_state);
+
+        // Per-subresource barrier: transition only plane 0 (depth) to COPY_SOURCE
+        if state_before != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            let mut barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                ..Default::default()
+            };
+            barrier.Anonymous.Transition =
+                std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: mem::transmute_copy(source),
+                    Subresource: 0, // plane 0 = depth
+                    StateBefore: state_before,
+                    StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                });
+            cmd_list.ResourceBarrier(&[barrier]);
+        }
+
+        // Determine the view format for the source depth plane
+        let _src_view_format = match src_format {
+            DXGI_FORMAT_D32_FLOAT_S8X24_UINT | DXGI_FORMAT_R32G8X24_TYPELESS => {
+                DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+            }
+            DXGI_FORMAT_D24_UNORM_S8_UINT | DXGI_FORMAT_R24G8_TYPELESS => {
+                DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+            }
+            _ => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        };
+
+        // CopyTextureRegion: depth plane → readback buffer
+        let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: mem::transmute_copy(readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: info.dxgi_format,
+                        Width: info.width,
+                        Height: info.height,
+                        Depth: 1,
+                        RowPitch: info.row_pitch,
+                    },
+                },
+            },
+        };
+        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: mem::transmute_copy(source),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0, // plane 0 = depth
+            },
+        };
+
+        let copy_box = D3D12_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: info.width,
+            bottom: info.height,
+            back: 1,
+        };
+        cmd_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, Some(&copy_box));
+
+        // Restore: transition plane 0 back to original state
+        if state_before != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            let mut barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                ..Default::default()
+            };
+            barrier.Anonymous.Transition =
+                std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: mem::transmute_copy(source),
+                    Subresource: 0, // plane 0
+                    StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    StateAfter: state_before,
+                });
+            cmd_list.ResourceBarrier(&[barrier]);
+        }
+    }
+
     /// Map the readback buffer for slot+parity, copy data out row-by-row (stripping pitch
     /// padding), and return the raw bytes plus buffer info. Returns None on failure.
     pub unsafe fn map_and_extract(
@@ -414,6 +522,24 @@ pub fn is_depth_stencil_format(format: DXGI_FORMAT) -> bool {
             | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
             | DXGI_FORMAT_X24_TYPELESS_G8_UINT
     )
+}
+
+/// Returns the typed format for reading depth plane 0 of a multi-plane depth-stencil resource.
+/// Used as the SRV/copy format for the depth-only readback buffer.
+pub fn depth_plane_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        // 64-bit D32+S8: depth plane is R32_FLOAT
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+        | DXGI_FORMAT_R32G8X24_TYPELESS
+        | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS => DXGI_FORMAT_R32_FLOAT,
+        // 32-bit D24+S8: depth plane is R24_UNORM_X8 — but readback as R32_FLOAT
+        // (CopyTextureRegion with R24_UNORM_X8_TYPELESS copies 32 bits per texel)
+        DXGI_FORMAT_D24_UNORM_S8_UINT
+        | DXGI_FORMAT_R24G8_TYPELESS
+        | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+        | DXGI_FORMAT_X24_TYPELESS_G8_UINT => DXGI_FORMAT_R32_FLOAT,
+        _ => DXGI_FORMAT_R32_FLOAT,
+    }
 }
 
 /// COM-refcounted handle for deferred readback on the writer thread.

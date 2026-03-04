@@ -1,3 +1,4 @@
 [workspace]
 resolver = "2"
 members = ["crates/fsr-sys", "crates/oxr-amd-fidelityfx-dx12", "crates/oxr-amd-fsr3-upscaler"]
+exclude = ["imba"]
