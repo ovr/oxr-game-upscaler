@@ -12,6 +12,11 @@ use windows::Win32::System::Threading::{
 
 use super::readback::BufferInfo;
 
+/// Pre-allocated buffer sizes for EXR compression (avoids reallocs for typical frames).
+const EXR_COLOR_BUF_CAPACITY: usize = 24 * 1024 * 1024;
+const EXR_MV_BUF_CAPACITY: usize = 6 * 1024 * 1024;
+const EXR_DEPTH_BUF_CAPACITY: usize = 6 * 1024 * 1024;
+
 /// Allocate a `Vec<T>` of the given length without zeroing memory.
 ///
 /// # Safety
@@ -520,15 +525,21 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let image = Image::from_layer(layer);
 
     let t2 = Instant::now();
+    let mut buf = Vec::with_capacity(EXR_COLOR_BUF_CAPACITY);
     image
         .write()
-        .to_file(path)
+        .to_buffered(std::io::Cursor::new(&mut buf))
         .map_err(|e| format!("write color EXR: {}", e))?;
-    let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
+    let compress_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
+    let t3 = Instant::now();
+    std::fs::write(path, &buf).map_err(|e| format!("write color EXR: {}", e))?;
+    let io_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+    let size_mb = buf.len() as f64 / (1024.0 * 1024.0);
     info!(
-        "writer: color convert={:.1}ms downscale={:.1}ms write={:.1}ms",
-        convert_ms, downscale_ms, write_ms,
+        "writer: color convert={:.1}ms downscale={:.1}ms compress={:.1}ms io={:.1}ms ({:.1}MB)",
+        convert_ms, downscale_ms, compress_ms, io_ms, size_mb,
     );
     Ok(())
 }
@@ -568,15 +579,21 @@ fn write_depth_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let image = Image::from_layer(layer);
 
     let t2 = Instant::now();
+    let mut buf = Vec::with_capacity(EXR_DEPTH_BUF_CAPACITY);
     image
         .write()
-        .to_file(path)
+        .to_buffered(std::io::Cursor::new(&mut buf))
         .map_err(|e| format!("write depth EXR: {}", e))?;
-    let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
+    let compress_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
+    let t3 = Instant::now();
+    std::fs::write(path, &buf).map_err(|e| format!("write depth EXR: {}", e))?;
+    let io_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+    let size_mb = buf.len() as f64 / (1024.0 * 1024.0);
     info!(
-        "writer: depth convert={:.1}ms downscale={:.1}ms write={:.1}ms",
-        convert_ms, downscale_ms, write_ms,
+        "writer: depth convert={:.1}ms downscale={:.1}ms compress={:.1}ms io={:.1}ms ({:.1}MB)",
+        convert_ms, downscale_ms, compress_ms, io_ms, size_mb,
     );
     Ok(())
 }
@@ -625,15 +642,21 @@ fn write_mv_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let image = Image::from_layer(layer);
 
     let t2 = Instant::now();
+    let mut buf = Vec::with_capacity(EXR_MV_BUF_CAPACITY);
     image
         .write()
-        .to_file(path)
+        .to_buffered(std::io::Cursor::new(&mut buf))
         .map_err(|e| format!("write mv EXR: {}", e))?;
-    let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
+    let compress_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
+    let t3 = Instant::now();
+    std::fs::write(path, &buf).map_err(|e| format!("write mv EXR: {}", e))?;
+    let io_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+    let size_mb = buf.len() as f64 / (1024.0 * 1024.0);
     info!(
-        "writer: mv convert={:.1}ms downscale={:.1}ms write={:.1}ms",
-        convert_ms, downscale_ms, write_ms,
+        "writer: mv convert={:.1}ms downscale={:.1}ms compress={:.1}ms io={:.1}ms ({:.1}MB)",
+        convert_ms, downscale_ms, compress_ms, io_ms, size_mb,
     );
     Ok(())
 }
