@@ -2,7 +2,7 @@ use std::mem;
 use tracing::{error, info};
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12Device, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList2, ID3D12Resource, D3D12_BOX,
-    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_READBACK,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_FLAG_NONE,
     D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -42,9 +42,15 @@ pub struct BufferInfo {
 
 /// Readback pool: 3 slots × 8 parities (4 for normal, 8 for Burst8 mode).
 pub struct ReadbackPool {
+    /// READBACK heap buffers — CPU-mappable destination for PCIe transfer.
     buffers: [[Option<ID3D12Resource>; NUM_PARITY]; NUM_SLOTS],
     infos: [[Option<BufferInfo>; NUM_PARITY]; NUM_SLOTS],
-    /// Small readback buffer holding one u32 per parity slot, used as a GPU completion marker.
+    /// VRAM staging buffers (DEFAULT heap, COPY_DEST). GPU writes here first (VRAM→VRAM,
+    /// ~0.06ms), then drain phase copies to READBACK over PCIe (spread across idle frames).
+    vram_staging: [[Option<ID3D12Resource>; NUM_PARITY]; NUM_SLOTS],
+    /// Small readback buffer holding two u32 per parity slot:
+    /// - bytes [0..31]: capture markers (set after texture→staging copy)
+    /// - bytes [32..63]: readback markers (set after staging→readback copy)
     marker_buffer: Option<ID3D12Resource>,
     marker_gpu_va: u64,
 }
@@ -54,6 +60,7 @@ impl ReadbackPool {
         Self {
             buffers: Default::default(),
             infos: Default::default(),
+            vram_staging: Default::default(),
             marker_buffer: None,
             marker_gpu_va: 0,
         }
@@ -153,6 +160,41 @@ impl ReadbackPool {
         Some(value)
     }
 
+    /// Record a GPU-side write of `value` to `readback_marker[parity]` (offset 32+parity*4).
+    /// Written after the staging→readback CopyBufferRegion, so CPU can poll completion.
+    pub unsafe fn write_readback_marker(
+        &self,
+        cmd_list: &ID3D12GraphicsCommandList2,
+        parity: usize,
+        value: u32,
+    ) {
+        if self.marker_buffer.is_none() || self.marker_gpu_va == 0 {
+            return;
+        }
+
+        let param = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: self.marker_gpu_va + (8 + parity as u64) * 4,
+            Value: value,
+        };
+        let mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+        cmd_list.WriteBufferImmediate(1, &param, Some(&mode));
+    }
+
+    /// Map the marker buffer and read the readback-done u32 at `parity` (offset 32+parity*4).
+    pub unsafe fn read_readback_marker(&self, parity: usize) -> Option<u32> {
+        let buf = self.marker_buffer.as_ref()?;
+
+        let mut mapped: *mut u8 = std::ptr::null_mut();
+        if let Err(e) = buf.Map(0, None, Some(&mut mapped as *mut *mut u8 as *mut *mut _)) {
+            error!("readback: readback marker Map failed: {}", e);
+            return None;
+        }
+
+        let value = std::ptr::read_unaligned(mapped.add((8 + parity) * 4) as *const u32);
+        buf.Unmap(0, None);
+        Some(value)
+    }
+
     /// Ensure a readback buffer exists for the given slot+parity with matching dimensions.
     /// Creates or recreates as needed. Returns false on failure.
     pub unsafe fn ensure_buffer(
@@ -186,10 +228,6 @@ impl ReadbackPool {
         let row_pitch = align_up(width * bpp / 8, PITCH_ALIGNMENT);
         let total_size = row_pitch as u64 * height as u64;
 
-        let heap_props = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_READBACK,
-            ..Default::default()
-        };
         let buf_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Alignment: 0,
@@ -204,6 +242,11 @@ impl ReadbackPool {
             },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+
+        let heap_props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
         };
 
         let mut resource: Option<ID3D12Resource> = None;
@@ -230,6 +273,33 @@ impl ReadbackPool {
             slot, parity, width, height, dxgi_format, row_pitch, total_size
         );
 
+        // Also create a VRAM staging buffer (DEFAULT heap). GPU writes here first (VRAM→VRAM),
+        // then drain phase copies to READBACK over PCIe. Same byte size as the readback buffer.
+        let heap_props_default = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut staging: Option<ID3D12Resource> = None;
+        match device.CreateCommittedResource(
+            &heap_props_default,
+            D3D12_HEAP_FLAG_NONE,
+            &buf_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut staging,
+        ) {
+            Ok(()) => {
+                self.vram_staging[s][p] = staging;
+            }
+            Err(e) => {
+                error!(
+                    "readback: VRAM staging CreateCommittedResource failed for {:?}[{}]: {}",
+                    slot, parity, e
+                );
+                // Non-fatal: fall back to direct texture→READBACK copy (no staging).
+            }
+        }
+
         self.buffers[s][p] = resource;
         self.infos[s][p] = Some(BufferInfo {
             width,
@@ -241,8 +311,9 @@ impl ReadbackPool {
         true
     }
 
-    /// Enqueue CopyTextureRegion from a GPU texture to the readback buffer for slot+parity.
-    /// Transitions the source texture to COPY_SOURCE, copies, then restores.
+    /// Enqueue CopyTextureRegion from a GPU texture to the VRAM staging buffer for slot+parity.
+    /// Transitions the source texture to COPY_SOURCE, copies to VRAM (fast, GPU-local), restores.
+    /// Drain phase later copies staging → READBACK over PCIe via `enqueue_staging_to_readback`.
     pub unsafe fn enqueue_copy(
         &self,
         cmd_list: &ID3D12GraphicsCommandList,
@@ -254,7 +325,11 @@ impl ReadbackPool {
         let s = slot as usize;
         let p = parity;
 
-        let readback = match &self.buffers[s][p] {
+        // Use VRAM staging if available; fall back to direct READBACK copy.
+        let dst_buf = match self.vram_staging[s][p]
+            .as_ref()
+            .or(self.buffers[s][p].as_ref())
+        {
             Some(r) => r,
             None => return,
         };
@@ -273,9 +348,9 @@ impl ReadbackPool {
             cmd_list.ResourceBarrier(&[b.clone()]);
         }
 
-        // CopyTextureRegion: texture → readback buffer (placed footprint)
+        // CopyTextureRegion: texture → staging buffer (placed footprint)
         let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: mem::transmute_copy(readback),
+            pResource: mem::transmute_copy(dst_buf),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
@@ -322,6 +397,7 @@ impl ReadbackPool {
     /// Enqueue copy of depth plane 0 from a multi-plane depth-stencil resource.
     /// Uses per-subresource barriers (plane 0 only) to avoid TDR from ALL_SUBRESOURCES
     /// on resources where depth and stencil planes are in different states.
+    /// Copies to VRAM staging (DEFAULT heap); drain phase moves to READBACK over PCIe.
     pub unsafe fn enqueue_copy_depth_plane(
         &self,
         cmd_list: &ID3D12GraphicsCommandList,
@@ -334,7 +410,11 @@ impl ReadbackPool {
         let s = slot as usize;
         let p = parity;
 
-        let readback = match &self.buffers[s][p] {
+        // Use VRAM staging if available; fall back to direct READBACK copy.
+        let dst_buf = match self.vram_staging[s][p]
+            .as_ref()
+            .or(self.buffers[s][p].as_ref())
+        {
             Some(r) => r,
             None => return,
         };
@@ -373,9 +453,9 @@ impl ReadbackPool {
             _ => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
         };
 
-        // CopyTextureRegion: depth plane → readback buffer
+        // CopyTextureRegion: depth plane → staging buffer
         let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: mem::transmute_copy(readback),
+            pResource: mem::transmute_copy(dst_buf),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
@@ -423,6 +503,56 @@ impl ReadbackPool {
                     StateAfter: state_before,
                 });
             cmd_list.ResourceBarrier(&[barrier]);
+        }
+    }
+
+    /// Copy VRAM staging buffer → READBACK buffer (PCIe transfer, ~30-47ms at 4K).
+    /// Called during drain phase so the PCIe cost is spread across idle skip frames, not
+    /// during burst capture. Transitions staging COPY_DEST→COPY_SOURCE, copies, restores.
+    pub unsafe fn enqueue_staging_to_readback(
+        &self,
+        cmd_list: &ID3D12GraphicsCommandList,
+        slot: Slot,
+        parity: usize,
+    ) {
+        let s = slot as usize;
+        let p = parity;
+
+        let staging = match &self.vram_staging[s][p] {
+            Some(r) => r,
+            None => return, // No staging buffer — direct copy path, nothing to do here.
+        };
+        let readback = match &self.buffers[s][p] {
+            Some(r) => r,
+            None => return,
+        };
+        let info = match &self.infos[s][p] {
+            Some(i) => i,
+            None => return,
+        };
+
+        let total_size = info.row_pitch as u64 * info.height as u64;
+
+        // Transition staging: COPY_DEST → COPY_SOURCE
+        if let Some(b) = dispatch::resource_barrier_transition_d3d12(
+            staging,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        ) {
+            cmd_list.ResourceBarrier(&[b]);
+        }
+
+        // CopyBufferRegion: staging (VRAM) → readback (system RAM, PCIe)
+        // READBACK heap is implicitly always in COPY_DEST — no barrier needed.
+        cmd_list.CopyBufferRegion(readback, 0, staging, 0, total_size);
+
+        // Restore staging to COPY_DEST so it's ready for the next burst cycle.
+        if let Some(b) = dispatch::resource_barrier_transition_d3d12(
+            staging,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        ) {
+            cmd_list.ResourceBarrier(&[b]);
         }
     }
 

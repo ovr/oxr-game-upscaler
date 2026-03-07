@@ -6,7 +6,6 @@ mod writer;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-
 use tracing::{error, info};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
@@ -60,6 +59,10 @@ struct RecorderState {
     burst_drain_idx: u8,
     /// Saved per-frame metadata for deferred drain.
     burst_metadata: [Option<FrameMetadata>; 8],
+    /// Bitmask: bit i set once staging→readback has been enqueued for parity i.
+    readback_queued: u8,
+    /// Expected readback-done marker value per parity (set when staging→readback is enqueued).
+    readback_expected_marker: [u32; 8],
 }
 
 static RECORDER: Mutex<Option<RecorderState>> = Mutex::new(None);
@@ -140,6 +143,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 burst_captured: 0,
                 burst_drain_idx: 0,
                 burst_metadata: Default::default(),
+                readback_queued: 0,
+                readback_expected_marker: [0; 8],
             });
             QUEUED_BYTES.store(0, Ordering::Relaxed);
             QUEUED_FRAMES.store(0, Ordering::Relaxed);
@@ -159,10 +164,14 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                     let mut drained = 0u8;
                     while state.burst_drain_idx < state.burst_captured && drained < 2 {
                         let idx = state.burst_drain_idx as usize;
-                        let expected = state.expected_marker[idx];
-                        if expected != 0 {
-                            match state.pool.read_marker(idx) {
-                                Some(marker) if marker == expected => {}
+                        let rb_queued = (state.readback_queued & (1u8 << idx)) != 0;
+                        if !rb_queued {
+                            break; // staging→readback not yet enqueued by post_dispatch
+                        }
+                        let rb_expected = state.readback_expected_marker[idx];
+                        if rb_expected != 0 {
+                            match state.pool.read_readback_marker(idx) {
+                                Some(marker) if marker == rb_expected => {}
                                 _ => break,
                             }
                         }
@@ -277,6 +286,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             }
             state.burst_captured = 0;
             state.burst_drain_idx = 0;
+            state.readback_queued = 0;
             for m in state.burst_metadata.iter_mut() {
                 *m = None;
             }
@@ -312,12 +322,19 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         while state.burst_drain_idx < state.burst_captured && drained < 2 {
             let idx = state.burst_drain_idx as usize;
 
-            // Check GPU marker for this slot
-            let expected = state.expected_marker[idx];
-            if expected != 0 {
-                match state.pool.read_marker(idx) {
-                    Some(marker) if marker == expected => {}
-                    _ => break, // GPU not ready yet, retry next dispatch
+            // Check GPU readback-done marker: staging→readback must be complete before Map.
+            let rb_queued = (state.readback_queued & (1u8 << idx)) != 0;
+            if !rb_queued {
+                // Staging→readback not yet enqueued (post_dispatch handles that); skip for now.
+                break;
+            }
+            let rb_expected = state.readback_expected_marker[idx];
+            if rb_expected != 0 {
+                match state.pool.read_readback_marker(idx) {
+                    Some(marker) if marker == rb_expected => {}
+                    _ => {
+                        break; // PCIe copy not yet complete, retry next dispatch
+                    }
                 }
             }
 
@@ -421,7 +438,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         }
     }
 
-    // Extract data from previous frame's readback buffers
+    // Extract data from previous frame's readback buffers (CPU Map/memcpy — on render thread!)
     let color = state
         .pool
         .map_and_extract(Slot::Color, prev_parity)
@@ -503,9 +520,19 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         return;
     }
 
-    // Skip GPU copies when stride says to skip this frame.
+    // During drain phase: check if any parities have staging copy done but readback not yet queued.
     if state.skip_this_frame {
-        return;
+        let has_pending = (0..state.burst_captured as usize).any(|idx| {
+            let bit = 1u8 << idx;
+            let not_queued = (state.readback_queued & bit) == 0;
+            let staging_done = state.expected_marker[idx] != 0
+                && state.pool.read_marker(idx) == Some(state.expected_marker[idx]);
+            not_queued && staging_done
+        });
+        if !has_pending {
+            return;
+        }
+        // Fall through to acquire cmd_list and flush staging→readback.
     }
 
     let cmd_list_raw = d.command_list;
@@ -530,6 +557,37 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         None => return,
     };
 
+    // During drain phase: enqueue staging→readback for all parities whose staging copy is done.
+    if state.skip_this_frame {
+        for idx in 0..state.burst_captured as usize {
+            let bit = 1u8 << idx;
+            if (state.readback_queued & bit) != 0 {
+                continue; // already queued
+            }
+            let expected = state.expected_marker[idx];
+            if expected == 0 || state.pool.read_marker(idx) != Some(expected) {
+                continue; // staging copy not yet done
+            }
+            // Enqueue VRAM→READBACK for all 3 slots
+            for slot in [Slot::Color, Slot::Depth, Slot::MotionVectors] {
+                state.pool.enqueue_staging_to_readback(&cmd_list, slot, idx);
+            }
+            // Write readback-done marker (signals CPU that PCIe copy is complete)
+            if let Ok(cmd_list2) = cmd_list.cast::<ID3D12GraphicsCommandList2>() {
+                state
+                    .pool
+                    .write_readback_marker(&cmd_list2, idx, state.write_counter);
+                state.readback_expected_marker[idx] = state.write_counter;
+                state.write_counter = state.write_counter.wrapping_add(1);
+                if state.write_counter == 0 {
+                    state.write_counter = 1;
+                }
+            }
+            state.readback_queued |= bit;
+        }
+        return;
+    }
+
     let is_burst = stride::get() == stride::Stride::Burst8;
     let parity = if is_burst {
         state.burst_captured as usize
@@ -544,41 +602,25 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                          ffx_w: u32,
                          ffx_h: u32| {
         if raw.is_null() {
-            info!("recording: {:?} skipped (null resource)", slot);
             return;
         }
         if let Some(res) = dispatch::borrow_resource(raw) {
             let desc = res.GetDesc();
             let actual_w = desc.Width as u32;
             let actual_h = desc.Height;
-            // Use D3D12 resource dimensions as fallback when FFX description is empty
             let eff_w = if ffx_w > 0 { ffx_w } else { actual_w };
             let eff_h = if ffx_h > 0 { ffx_h } else { actual_h };
-            info!(
-                "recording: {:?} ffx={}x{} d3d12={}x{} eff={}x{} fmt={:?} ffx_state=0x{:x}",
-                slot, ffx_w, ffx_h, actual_w, actual_h, eff_w, eff_h, desc.Format, ffx_state
-            );
             if eff_w == 0 || eff_h == 0 {
-                info!("recording: {:?} skipped (zero dimensions)", slot);
                 return;
             }
-            // Use actual D3D12 resource dimensions — FFX descriptor may report different
-            // sizes (e.g. render region vs texture size). Copy box must not exceed the
-            // actual resource or we get a GPU crash (TDR).
             let copy_w = eff_w.min(actual_w);
             let copy_h = eff_h.min(actual_h);
-            // Multi-plane depth-stencil: copy only depth plane (plane 0) as R32_FLOAT.
-            // Per-subresource barriers are needed because planes may be in different states.
             if is_depth_stencil_format(desc.Format) {
                 let readback_fmt = readback::depth_plane_format(desc.Format);
                 if state
                     .pool
                     .ensure_buffer(&device, slot, parity, copy_w, copy_h, readback_fmt)
                 {
-                    info!(
-                        "recording: enqueue_copy_depth_plane {:?}[{}] src_fmt={:?} rb_fmt={:?}",
-                        slot, parity, desc.Format, readback_fmt
-                    );
                     state.pool.enqueue_copy_depth_plane(
                         &cmd_list,
                         slot,
@@ -592,7 +634,6 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 .pool
                 .ensure_buffer(&device, slot, parity, copy_w, copy_h, desc.Format)
             {
-                info!("recording: enqueue_copy {:?}[{}]", slot, parity);
                 state
                     .pool
                     .enqueue_copy(&cmd_list, slot, parity, &res, ffx_state);
