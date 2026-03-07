@@ -13,7 +13,7 @@ use windows::Win32::System::Threading::{
 use super::readback::BufferInfo;
 
 /// Pre-allocated buffer sizes for EXR compression (avoids reallocs for typical frames).
-const EXR_COLOR_BUF_CAPACITY: usize = 24 * 1024 * 1024;
+const EXR_COLOR_BUF_CAPACITY: usize = 18 * 1024 * 1024;
 const EXR_MV_BUF_CAPACITY: usize = 6 * 1024 * 1024;
 const EXR_DEPTH_BUF_CAPACITY: usize = 6 * 1024 * 1024;
 
@@ -202,33 +202,33 @@ fn write_frame(session_dir: &PathBuf, packet: &FramePacket) -> Result<(), String
     Ok(())
 }
 
-/// Convert raw texture data to f16 RGBA pixels based on DXGI format.
-/// For R16G16B16A16_FLOAT (the common case), this is a direct copy — no conversion needed.
-fn convert_to_rgba_f16(tex: &TextureData) -> Vec<half::f16> {
+/// Convert raw texture data to f16 RGB pixels based on DXGI format.
+/// For R16G16B16A16_FLOAT (the common case), copies only R/G/B channels — no conversion needed.
+fn convert_to_rgb_f16(tex: &TextureData) -> Vec<half::f16> {
     let w = tex.info.width as usize;
     let h = tex.info.height as usize;
     let pixel_count = w * h;
 
     match tex.info.dxgi_format {
         DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => {
-            // 8 bytes per pixel, 4 × f16 — direct copy
+            // 8 bytes per pixel, 4 × f16 — copy R/G/B, skip A
             // SAFETY: every element is written in the loop below before being read.
-            let mut out = unsafe { vec_uninit::<half::f16>(pixel_count * 4) };
+            let mut out = unsafe { vec_uninit::<half::f16>(pixel_count * 3) };
             for i in 0..pixel_count {
                 let offset = i * 8;
-                for c in 0..4 {
+                for c in 0..3 {
                     let bits = u16::from_le_bytes([
                         tex.data[offset + c * 2],
                         tex.data[offset + c * 2 + 1],
                     ]);
-                    out[i * 4 + c] = half::f16::from_bits(bits);
+                    out[i * 3 + c] = half::f16::from_bits(bits);
                 }
             }
             out
         }
         // All other formats: convert via f32 intermediary
         _ => {
-            let f32_data = convert_to_rgba_f32(tex);
+            let f32_data = convert_to_rgb_f32(tex);
             f32_data.into_iter().map(half::f16::from_f32).collect()
         }
     }
@@ -265,52 +265,51 @@ fn downscale_2x_f16(
     (nw, nh, out)
 }
 
-/// Convert raw texture data to f32 RGBA pixels based on DXGI format.
-fn convert_to_rgba_f32(tex: &TextureData) -> Vec<f32> {
+/// Convert raw texture data to f32 RGB pixels based on DXGI format.
+fn convert_to_rgb_f32(tex: &TextureData) -> Vec<f32> {
     let w = tex.info.width as usize;
     let h = tex.info.height as usize;
     let pixel_count = w * h;
-    let mut out = vec![0.0f32; pixel_count * 4];
+    let mut out = vec![0.0f32; pixel_count * 3];
 
     match tex.info.dxgi_format {
         DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => {
-            // 8 bytes per pixel, 4 × f16
+            // 8 bytes per pixel, 4 × f16 — read only R/G/B
             for i in 0..pixel_count {
                 let offset = i * 8;
-                for c in 0..4 {
+                for c in 0..3 {
                     let bits = u16::from_le_bytes([
                         tex.data[offset + c * 2],
                         tex.data[offset + c * 2 + 1],
                     ]);
-                    out[i * 4 + c] = half::f16::from_bits(bits).to_f32();
+                    out[i * 3 + c] = half::f16::from_bits(bits).to_f32();
                 }
             }
         }
         DXGI_FORMAT_R8G8B8A8_UNORM
         | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
         | DXGI_FORMAT_R8G8B8A8_TYPELESS => {
-            // 4 bytes per pixel
+            // 4 bytes per pixel — read only R/G/B
             for i in 0..pixel_count {
                 let offset = i * 4;
-                for c in 0..4 {
-                    out[i * 4 + c] = tex.data[offset + c] as f32 / 255.0;
+                for c in 0..3 {
+                    out[i * 3 + c] = tex.data[offset + c] as f32 / 255.0;
                 }
             }
         }
         DXGI_FORMAT_B8G8R8A8_UNORM
         | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
         | DXGI_FORMAT_B8G8R8A8_TYPELESS => {
-            // 4 bytes per pixel, BGRA → RGBA
+            // 4 bytes per pixel, BGRA → RGB
             for i in 0..pixel_count {
                 let offset = i * 4;
-                out[i * 4] = tex.data[offset + 2] as f32 / 255.0; // R
-                out[i * 4 + 1] = tex.data[offset + 1] as f32 / 255.0; // G
-                out[i * 4 + 2] = tex.data[offset] as f32 / 255.0; // B
-                out[i * 4 + 3] = tex.data[offset + 3] as f32 / 255.0; // A
+                out[i * 3] = tex.data[offset + 2] as f32 / 255.0; // R
+                out[i * 3 + 1] = tex.data[offset + 1] as f32 / 255.0; // G
+                out[i * 3 + 2] = tex.data[offset] as f32 / 255.0; // B
             }
         }
         DXGI_FORMAT_R11G11B10_FLOAT => {
-            // 4 bytes per pixel, packed
+            // 4 bytes per pixel, packed — no alpha
             for i in 0..pixel_count {
                 let offset = i * 4;
                 let bits = u32::from_le_bytes([
@@ -319,10 +318,9 @@ fn convert_to_rgba_f32(tex: &TextureData) -> Vec<f32> {
                     tex.data[offset + 2],
                     tex.data[offset + 3],
                 ]);
-                out[i * 4] = unpack_r11(bits & 0x7FF);
-                out[i * 4 + 1] = unpack_r11((bits >> 11) & 0x7FF);
-                out[i * 4 + 2] = unpack_r10((bits >> 22) & 0x3FF);
-                out[i * 4 + 3] = 1.0;
+                out[i * 3] = unpack_r11(bits & 0x7FF);
+                out[i * 3 + 1] = unpack_r11((bits >> 11) & 0x7FF);
+                out[i * 3 + 2] = unpack_r10((bits >> 22) & 0x3FF);
             }
         }
         DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_TYPELESS => {
@@ -334,18 +332,17 @@ fn convert_to_rgba_f32(tex: &TextureData) -> Vec<f32> {
                     tex.data[offset + 2],
                     tex.data[offset + 3],
                 ]);
-                out[i * 4] = (bits & 0x3FF) as f32 / 1023.0;
-                out[i * 4 + 1] = ((bits >> 10) & 0x3FF) as f32 / 1023.0;
-                out[i * 4 + 2] = ((bits >> 20) & 0x3FF) as f32 / 1023.0;
-                out[i * 4 + 3] = ((bits >> 30) & 0x3) as f32 / 3.0;
+                out[i * 3] = (bits & 0x3FF) as f32 / 1023.0;
+                out[i * 3 + 1] = ((bits >> 10) & 0x3FF) as f32 / 1023.0;
+                out[i * 3 + 2] = ((bits >> 20) & 0x3FF) as f32 / 1023.0;
             }
         }
         DXGI_FORMAT_R32G32B32A32_FLOAT | DXGI_FORMAT_R32G32B32A32_TYPELESS => {
-            // 16 bytes per pixel, 4 × f32
+            // 16 bytes per pixel, 4 × f32 — read only R/G/B
             for i in 0..pixel_count {
                 let offset = i * 16;
-                for c in 0..4 {
-                    out[i * 4 + c] = f32::from_le_bytes([
+                for c in 0..3 {
+                    out[i * 3 + c] = f32::from_le_bytes([
                         tex.data[offset + c * 4],
                         tex.data[offset + c * 4 + 1],
                         tex.data[offset + c * 4 + 2],
@@ -481,17 +478,17 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let mut h = tex.info.height as usize;
 
     let t0 = Instant::now();
-    let mut rgba = convert_to_rgba_f16(tex);
+    let mut rgb = convert_to_rgb_f16(tex);
     let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut downscale_ms = 0.0;
     if should_downscale(w, h) {
         let t1 = Instant::now();
-        let (nw, nh, scaled) = downscale_2x_f16(&rgba, w, h, 4);
+        let (nw, nh, scaled) = downscale_2x_f16(&rgb, w, h, 3);
         downscale_ms = t1.elapsed().as_secs_f64() * 1000.0;
         w = nw;
         h = nh;
-        rgba = scaled;
+        rgb = scaled;
     }
 
     // Split into separate channels
@@ -499,12 +496,10 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let mut r = unsafe { vec_uninit::<half::f16>(w * h) };
     let mut g = unsafe { vec_uninit::<half::f16>(w * h) };
     let mut b = unsafe { vec_uninit::<half::f16>(w * h) };
-    let mut a = unsafe { vec_uninit::<half::f16>(w * h) };
     for i in 0..w * h {
-        r[i] = rgba[i * 4];
-        g[i] = rgba[i * 4 + 1];
-        b[i] = rgba[i * 4 + 2];
-        a[i] = rgba[i * 4 + 3];
+        r[i] = rgb[i * 3];
+        g[i] = rgb[i * 3 + 1];
+        b[i] = rgb[i * 3 + 2];
     }
 
     use exr::prelude::*;
@@ -513,7 +508,6 @@ fn write_color_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
         AnyChannel::new("R", FlatSamples::F16(r)),
         AnyChannel::new("G", FlatSamples::F16(g)),
         AnyChannel::new("B", FlatSamples::F16(b)),
-        AnyChannel::new("A", FlatSamples::F16(a)),
     ]);
     let layer = Layer::new(
         (w, h),
