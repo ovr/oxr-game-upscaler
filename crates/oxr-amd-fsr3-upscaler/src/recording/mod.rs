@@ -20,6 +20,7 @@ use readback::{is_depth_stencil_format, ReadbackPool, Slot};
 use writer::{FrameMetadata, FramePacket, TextureData, WriterMessage};
 
 const VK_F10: i32 = 0x79;
+const VK_F11: i32 = 0x7A;
 
 /// 40 GiB buffer limit — when queued data exceeds this, recording stops automatically.
 pub(crate) const MAX_BUFFER_BYTES: u64 = 40 * 1024 * 1024 * 1024;
@@ -29,6 +30,7 @@ pub(crate) static QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static QUEUED_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// Persists across start/stop so we don't lose rising-edge state when RecorderState is dropped.
 static PREV_F10: AtomicBool = AtomicBool::new(false);
+static PREV_F11: AtomicBool = AtomicBool::new(false);
 
 struct RecorderState {
     pool: ReadbackPool,
@@ -63,6 +65,21 @@ struct RecorderState {
     readback_queued: u8,
     /// Expected readback-done marker value per parity (set when staging→readback is enqueued).
     readback_expected_marker: [u32; 8],
+    /// One-shot burst: F11 fires a single burst of 8 frames then auto-stops.
+    one_shot: bool,
+    /// Timestamp label for one-shot burst filenames (e.g. "20260308_211643").
+    one_shot_label: Option<String>,
+}
+
+impl RecorderState {
+    /// Burst label for filenames: timestamp for one-shot, "burst_NNN" for continuous.
+    fn burst_label(&self) -> String {
+        if let Some(label) = &self.one_shot_label {
+            label.clone()
+        } else {
+            format!("burst_{:03}", self.burst_number)
+        }
+    }
 }
 
 static RECORDER: Mutex<Option<RecorderState>> = Mutex::new(None);
@@ -72,6 +89,10 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     let f10_down = (GetAsyncKeyState(VK_F10) as u16 & 0x8000) != 0;
     let prev = PREV_F10.swap(f10_down, Ordering::Relaxed);
     let toggled = f10_down && !prev;
+
+    let f11_down = (GetAsyncKeyState(VK_F11) as u16 & 0x8000) != 0;
+    let prev_f11 = PREV_F11.swap(f11_down, Ordering::Relaxed);
+    let f11_toggled = f11_down && !prev_f11;
 
     let mut guard = match RECORDER.lock() {
         Ok(g) => g,
@@ -145,6 +166,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 burst_metadata: Default::default(),
                 readback_queued: 0,
                 readback_expected_marker: [0; 8],
+                one_shot: false,
+                one_shot_label: None,
             });
             QUEUED_BYTES.store(0, Ordering::Relaxed);
             QUEUED_FRAMES.store(0, Ordering::Relaxed);
@@ -152,6 +175,71 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             info!("recording: started → {}", session_dir.display());
             return;
         }
+    }
+
+    // F11: one-shot burst recording (8 frames → auto-stop)
+    if f11_toggled && !RECORDING_ACTIVE.load(Ordering::Relaxed) {
+        let recordings_dir = crate::settings::get().recording_path.clone();
+        let burst_dir = recordings_dir.join("burst8");
+        if let Err(e) = std::fs::create_dir_all(&burst_dir) {
+            error!("recording: failed to create burst8 dir: {}", e);
+            return;
+        }
+
+        let sender = writer::spawn_writer(burst_dir.clone());
+        let extractor_sender = extractor::spawn_extractor(sender.clone());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Format as YYYYMMDD_HHMMSS (UTC)
+        let secs_per_day = 86400u64;
+        let secs_per_hour = 3600u64;
+        let secs_per_min = 60u64;
+        let days = now / secs_per_day;
+        let time_of_day = now % secs_per_day;
+        let hh = time_of_day / secs_per_hour;
+        let mm = (time_of_day % secs_per_hour) / secs_per_min;
+        let ss = time_of_day % secs_per_min;
+        // Days since epoch → year/month/day
+        let (y, m_val, d_val) = epoch_days_to_ymd(days as i64);
+        let label = format!(
+            "burst_{:04}{:02}{:02}_{:02}{:02}{:02}",
+            y, m_val, d_val, hh, mm, ss
+        );
+
+        *guard = Some(RecorderState {
+            pool: ReadbackPool::new(),
+            sender,
+            extractor_sender,
+            _session_dir: burst_dir.clone(),
+            frame_number: 0,
+            parity: 0,
+            warmup_frames: 3,
+            stalled: false,
+            write_counter: 1,
+            expected_marker: [0; 8],
+            stride_counter: 0,
+            skip_this_frame: false,
+            drain_frames: 0,
+            burst_number: 0,
+            burst_captured: 0,
+            burst_drain_idx: 0,
+            burst_metadata: Default::default(),
+            readback_queued: 0,
+            readback_expected_marker: [0; 8],
+            one_shot: true,
+            one_shot_label: Some(label),
+        });
+        QUEUED_BYTES.store(0, Ordering::Relaxed);
+        QUEUED_FRAMES.store(0, Ordering::Relaxed);
+        RECORDING_ACTIVE.store(true, Ordering::Relaxed);
+        info!(
+            "recording: one-shot burst started → {}",
+            burst_dir.display()
+        );
+        return;
     }
 
     // If recording, map previous frame's readback and send to writer
@@ -203,7 +291,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                             let packet = DeferredFramePacket {
                                 frame_number: state.frame_number,
                                 estimated_bytes,
-                                burst_number: Some(state.burst_number),
+                                burst_number: Some(state.burst_label()),
                                 color,
                                 depth,
                                 motion_vectors,
@@ -276,7 +364,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     let current_stride = stride::get();
 
     // === Burst8 mode: deferred readback ===
-    if current_stride == stride::Stride::Burst8 {
+    if current_stride == stride::Stride::Burst8 || state.one_shot {
         let pos = stride::burst_position(state.stride_counter);
 
         // Reset burst state at cycle start
@@ -372,7 +460,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             let packet = DeferredFramePacket {
                 frame_number: state.frame_number,
                 estimated_bytes,
-                burst_number: Some(state.burst_number),
+                burst_number: Some(state.burst_label()),
                 color,
                 depth,
                 motion_vectors,
@@ -403,6 +491,22 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             state.frame_number += 1;
             state.burst_drain_idx += 1;
             drained += 1;
+        }
+
+        // One-shot: auto-stop once all 8 frames have been drained
+        if state.one_shot
+            && state.burst_drain_idx >= state.burst_captured
+            && state.burst_captured == 8
+        {
+            info!(
+                "recording: one-shot burst complete ({} frames), stopping",
+                state.burst_captured
+            );
+            RECORDING_ACTIVE.store(false, Ordering::Relaxed);
+            let _ = state.extractor_sender.send(ExtractorMessage::Shutdown);
+            state.drain_frames = 4;
+            state.stride_counter += 1;
+            return;
         }
 
         state.stride_counter += 1;
@@ -588,7 +692,10 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         return;
     }
 
-    let is_burst = stride::get() == stride::Stride::Burst8;
+    let is_burst = stride::get() == stride::Stride::Burst8 || state.one_shot;
+    if is_burst && state.burst_captured >= stride::BURST_RECORD as u8 {
+        return; // All burst slots filled — wait for drain
+    }
     let parity = if is_burst {
         state.burst_captured as usize
     } else {
@@ -706,4 +813,20 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
     } else {
         state.parity = (state.parity + 1) % 4;
     }
+}
+
+/// Convert days since Unix epoch to (year, month, day). Civil calendar, no leap-second fuss.
+fn epoch_days_to_ymd(days: i64) -> (i64, u32, u32) {
+    // Algorithm from Howard Hinnant (public domain).
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }

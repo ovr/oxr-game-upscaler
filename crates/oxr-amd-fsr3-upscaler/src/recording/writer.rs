@@ -60,7 +60,7 @@ pub struct FramePacket {
     /// Total raw bytes of texture data in this packet (for buffer accounting).
     pub packet_bytes: u64,
     /// Burst number for Burst8 mode (None for non-burst modes).
-    pub burst_number: Option<u64>,
+    pub burst_number: Option<String>,
     pub color: Option<TextureData>,
     pub depth: Option<TextureData>,
     pub motion_vectors: Option<TextureData>,
@@ -167,9 +167,9 @@ fn write_frame(session_dir: &PathBuf, packet: &FramePacket) -> Result<(), String
     });
 
     let fname = |suffix: &str, ext: &str| -> PathBuf {
-        match packet.burst_number {
-            Some(b) => {
-                session_dir.join(format!("burst_{:03}_frame_{:06}_{}.{}", b, n, suffix, ext))
+        match &packet.burst_number {
+            Some(prefix) => {
+                session_dir.join(format!("{}_frame_{:06}_{}.{}", prefix, n, suffix, ext))
             }
             None => session_dir.join(format!("frame_{:06}_{}.{}", n, suffix, ext)),
         }

@@ -16,7 +16,7 @@ pub struct DeferredFramePacket {
     /// Estimated raw bytes (from BufferInfo: width * height * bpp/8 per slot).
     pub estimated_bytes: u64,
     /// Burst number for Burst8 mode (None for non-burst modes).
-    pub burst_number: Option<u64>,
+    pub burst_number: Option<String>,
     pub color: Option<DeferredTextureData>,
     pub depth: Option<DeferredTextureData>,
     pub motion_vectors: Option<DeferredTextureData>,
