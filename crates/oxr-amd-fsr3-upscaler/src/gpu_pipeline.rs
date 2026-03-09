@@ -316,27 +316,45 @@ unsafe fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSigna
         },
     ];
 
-    let static_sampler = D3D12_STATIC_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        MipLODBias: 0.0,
-        MaxAnisotropy: 0,
-        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-        BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
-        MinLOD: 0.0,
-        MaxLOD: f32::MAX,
-        ShaderRegister: 0,
-        RegisterSpace: 0,
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-    };
+    // Two static samplers: s0 = linear clamp, s1 = point clamp
+    let static_samplers = [
+        D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 0,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+            ShaderRegister: 0,
+            RegisterSpace: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+        D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 0,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+            ShaderRegister: 1,
+            RegisterSpace: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+    ];
 
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
         pParameters: params.as_ptr(),
-        NumStaticSamplers: 1,
-        pStaticSamplers: &static_sampler,
+        NumStaticSamplers: static_samplers.len() as u32,
+        pStaticSamplers: static_samplers.as_ptr(),
         Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
     };
 

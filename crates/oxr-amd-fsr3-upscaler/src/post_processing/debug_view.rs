@@ -1,8 +1,7 @@
 use crate::gpu_pipeline;
 use crate::post_processing::PostContext;
 use crate::upscaler_type;
-use crate::upscalers::{borrow_resource, create_typed_srv};
-use tracing::info;
+use crate::upscalers::{borrow_resource, create_native_srv, create_typed_srv};
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -14,9 +13,9 @@ pub fn is_enabled() -> bool {
     upscaler_type::debug_view_get()
 }
 
-/// Draw 6 debug tiles (FSR3 internal textures) on top of the current render target.
-/// Layout: left column (3 tiles) | center (untouched) | right column (3 tiles).
-/// Each side column is 1/5 output width.
+/// Draw debug tiles (FSR3 internal textures) on top of the current render target.
+/// Layout: left column | center (untouched) | right column.
+/// Each side column is 1/5 output width. NULL resources are skipped.
 ///
 /// Assumes: output is already in RENDER_TARGET state with RTV bound at slot 0.
 pub unsafe fn apply(ctx: &PostContext) {
@@ -30,6 +29,7 @@ pub unsafe fn apply(ctx: &PostContext) {
         resource_ptr: *mut core::ffi::c_void,
         ffx_state: u32,
         ffx_format: u32,
+        /// 0=RGB, 1=depth gray, 2=motion vectors, 3=mask, 4=depth colorized, 5=integer (point sampled)
         viz_mode: u32,
         srv_slot: u32,
     }
@@ -60,7 +60,7 @@ pub unsafe fn apply(ctx: &PostContext) {
             resource_ptr: d.reconstructed_prev_nearest_depth.resource,
             ffx_state: d.reconstructed_prev_nearest_depth.state,
             ffx_format: d.reconstructed_prev_nearest_depth.description.format,
-            viz_mode: 1,
+            viz_mode: 5, // R8_UINT — needs point sampler
             srv_slot: 5,
         },
         DebugTile {
@@ -74,7 +74,7 @@ pub unsafe fn apply(ctx: &PostContext) {
             resource_ptr: d.depth.resource,
             ffx_state: d.depth.state,
             ffx_format: d.depth.description.format,
-            viz_mode: 1,
+            viz_mode: 4,
             srv_slot: 7,
         },
     ];
@@ -99,9 +99,50 @@ pub unsafe fn apply(ctx: &PostContext) {
         cmd_list.ResourceBarrier(&barriers_before);
     }
 
-    // Grid layout
+    // Compact: only tiles with non-null resources get rendered
+    let mut visible: Vec<(usize, &DebugTile)> = Vec::new();
+    for (i, tile) in tiles.iter().enumerate() {
+        if tile_resources[i].is_some() {
+            visible.push((i, tile));
+        }
+    }
+
+    let n = visible.len() as u32;
+    if n == 0 {
+        return;
+    }
+
+    // Layout: two columns (left/right), max 75% screen height, centered vertically
+    let left_count = (n + 1) / 2; // ceil(n/2)
+    let right_count = n - left_count;
+    let margin = 15u32;
+    let gap = 2u32;
     let side_w = output_w / 5;
-    let tile_h = output_h / 3;
+    let max_col_h = output_h * 60 / 100;
+    let left_gaps = if left_count > 1 {
+        (left_count - 1) * gap
+    } else {
+        0
+    };
+    let right_gaps = if right_count > 1 {
+        (right_count - 1) * gap
+    } else {
+        0
+    };
+    let left_tile_h = (max_col_h - left_gaps) / left_count;
+    let right_tile_h = if right_count > 0 {
+        (max_col_h - right_gaps) / right_count
+    } else {
+        0
+    };
+    let left_total_h = left_tile_h * left_count + left_gaps;
+    let right_total_h = right_tile_h * right_count + right_gaps;
+    let left_y0 = (output_h - left_total_h) / 2;
+    let right_y0 = if right_count > 0 {
+        (output_h - right_total_h) / 2
+    } else {
+        0
+    };
     let center_w = output_w - 2 * side_w;
 
     cmd_list.SetGraphicsRootSignature(&gpu.root_signature);
@@ -111,19 +152,35 @@ pub unsafe fn apply(ctx: &PostContext) {
     let rtv_output = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
     cmd_list.OMSetRenderTargets(1, Some(&rtv_output), false, None);
 
-    for (i, tile) in tiles.iter().enumerate() {
-        let res = match &tile_resources[i] {
-            Some(r) => r,
-            None => continue,
-        };
+    for (vi, &(res_idx, tile)) in visible.iter().enumerate() {
+        let res = tile_resources[res_idx].as_ref().unwrap();
+        let vi = vi as u32;
 
-        let (tile_x, tile_y) = if i < 3 {
-            (0u32, (i as u32) * tile_h)
+        let (tile_x, tile_y, tile_w, tile_h) = if vi < left_count {
+            (
+                margin,
+                left_y0 + vi * (left_tile_h + gap),
+                side_w,
+                left_tile_h,
+            )
         } else {
-            (side_w + center_w, ((i - 3) as u32) * tile_h)
+            let ri = vi - left_count;
+            (
+                output_w - side_w - margin,
+                right_y0 + ri * (right_tile_h + gap),
+                side_w,
+                right_tile_h,
+            )
         };
 
-        if !create_typed_srv(gpu, res, tile.ffx_format, tile.srv_slot) {
+        // Create SRV: use native format for integer textures, typed for others
+        let srv_ok = if tile.viz_mode == 5 {
+            create_native_srv(gpu, res, tile.srv_slot)
+        } else {
+            create_typed_srv(gpu, res, tile.ffx_format, tile.srv_slot)
+        };
+
+        if !srv_ok {
             continue;
         }
 
@@ -140,7 +197,7 @@ pub unsafe fn apply(ctx: &PostContext) {
         let viewport = D3D12_VIEWPORT {
             TopLeftX: tile_x as f32,
             TopLeftY: tile_y as f32,
-            Width: side_w as f32,
+            Width: tile_w as f32,
             Height: tile_h as f32,
             MinDepth: 0.0,
             MaxDepth: 1.0,
@@ -148,7 +205,7 @@ pub unsafe fn apply(ctx: &PostContext) {
         let scissor = windows::Win32::Foundation::RECT {
             left: tile_x as i32,
             top: tile_y as i32,
-            right: (tile_x + side_w) as i32,
+            right: (tile_x + tile_w) as i32,
             bottom: (tile_y + tile_h) as i32,
         };
         cmd_list.RSSetViewports(&[viewport]);
@@ -158,27 +215,15 @@ pub unsafe fn apply(ctx: &PostContext) {
     }
 
     // Restore tile resource barriers.
-    let tile_ffx_states = [
-        d.motion_vectors.state,
-        d.transparency_and_composition.state,
-        d.dilated_depth.state,
-        d.reconstructed_prev_nearest_depth.state,
-        d.reactive.state,
-        d.depth.state,
-    ];
-    let mut barriers_after = Vec::new();
-    for (idx, ffx_state) in tile_ffx_states.iter().enumerate() {
-        if let Some(r) = &tile_resources[idx] {
-            barriers_after.push(resource_barrier_transition_d3d12(
+    for (i, tile) in tiles.iter().enumerate() {
+        if let Some(r) = &tile_resources[i] {
+            let orig_state = ffx_state_to_d3d12(tile.ffx_state);
+            let barrier = resource_barrier_transition_d3d12(
                 r,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                ffx_state_to_d3d12(*ffx_state),
-            ));
+                orig_state,
+            );
+            cmd_list.ResourceBarrier(&[barrier]);
         }
     }
-    if !barriers_after.is_empty() {
-        cmd_list.ResourceBarrier(&barriers_after);
-    }
-
-    info!("debug tiles rendered");
 }

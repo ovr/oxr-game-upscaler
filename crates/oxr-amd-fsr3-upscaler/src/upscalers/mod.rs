@@ -90,6 +90,36 @@ pub unsafe fn create_typed_srv(
     true
 }
 
+/// Create an SRV using the resource's native format (no reinterpretation).
+/// Works for integer formats (R8_UINT etc.) that need a point sampler.
+pub unsafe fn create_native_srv(gpu: &GpuState, resource: &ID3D12Resource, slot: u32) -> bool {
+    let format = resource.GetDesc().Format;
+    if format == DXGI_FORMAT_UNKNOWN {
+        return false;
+    }
+
+    let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            },
+        },
+    };
+
+    gpu.device.CreateShaderResourceView(
+        resource,
+        Some(&srv_desc),
+        gpu_pipeline::get_srv_cpu_handle(gpu, slot),
+    );
+    true
+}
+
 /// Borrow a COM resource from a raw FFX pointer, returning None if null.
 pub unsafe fn borrow_resource(raw: *mut core::ffi::c_void) -> Option<ID3D12Resource> {
     if raw.is_null() {
