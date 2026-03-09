@@ -1,3 +1,6 @@
+use crate::dispatch::{
+    ffx_state_to_d3d12, resource_barrier_transition, resource_barrier_transition_d3d12,
+};
 use crate::gpu_pipeline;
 use crate::upscaler_type;
 use crate::upscalers::{create_typed_srv, DispatchContext};
@@ -9,12 +12,31 @@ use windows::Win32::Graphics::Direct3D12::*;
 const SRV_COLOR: u32 = 0;
 
 /// Single-pass spatial upscaler dispatch (Bilinear, Lanczos, SGSR).
-/// Output must already be in RENDER_TARGET state with color in PIXEL_SHADER_RESOURCE.
+/// Handles all barriers internally: transitions color→PSR and output→RT on entry,
+/// restores color to original FFX state on exit. Leaves output in RENDER_TARGET.
 /// Returns FFX_OK (0) on success.
 pub unsafe fn dispatch(ctx: &DispatchContext) -> u32 {
     let gpu = ctx.gpu;
     let cmd_list = ctx.cmd_list;
     let d = ctx.d;
+
+    // Entry barriers: color -> PIXEL_SHADER_RESOURCE, output -> RENDER_TARGET
+    let barriers_before = [
+        resource_barrier_transition(
+            ctx.color_res,
+            d.color.state,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ),
+        resource_barrier_transition(
+            ctx.output_res,
+            d.output.state,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ),
+    ];
+    let valid_before: Vec<_> = barriers_before.iter().flatten().cloned().collect();
+    if !valid_before.is_empty() {
+        cmd_list.ResourceBarrier(&valid_before);
+    }
 
     let color_tex_w = d.color.description.width;
     let color_tex_h = d.color.description.height;
@@ -75,6 +97,16 @@ pub unsafe fn dispatch(ctx: &DispatchContext) -> u32 {
     cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd_list.DrawInstanced(3, 1, 0, 0);
     gpu_pipeline::log_device_removed_reason(&gpu.device);
+
+    // Exit barrier: restore color to original FFX state (output stays in RENDER_TARGET)
+    let barrier = resource_barrier_transition_d3d12(
+        ctx.color_res,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ffx_state_to_d3d12(d.color.state),
+    );
+    if let Some(b) = barrier {
+        cmd_list.ResourceBarrier(&[b]);
+    }
 
     info!(
         render = format_args!("{}x{}", ctx.render_w, ctx.render_h),

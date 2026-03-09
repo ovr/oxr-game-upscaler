@@ -104,34 +104,14 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     };
 
     // --- Dispatch upscaler ---
-    // SGSRv2 temporal upscalers manage their own barriers internally.
-    // Simple upscalers need color->PSR and output->RT barriers.
+    // Each upscaler manages its own barriers internally.
+    // Contract: receives resources in original FFX states, leaves output in RENDER_TARGET.
     let result = match current_upscaler {
         upscaler_type::UpscalerType::SGSRv2TwoPass => upscalers::sgsr2_two_pass::dispatch(&ctx),
         upscaler_type::UpscalerType::SGSRv2 => upscalers::sgsr2_three_pass::dispatch(&ctx),
         upscaler_type::UpscalerType::Bilinear
         | upscaler_type::UpscalerType::Lanczos
-        | upscaler_type::UpscalerType::SGSR => {
-            // Barriers: color -> PIXEL_SHADER_RESOURCE, output -> RENDER_TARGET
-            let barriers_before = [
-                resource_barrier_transition(
-                    &color_res,
-                    d.color.state,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                ),
-                resource_barrier_transition(
-                    &output_res,
-                    d.output.state,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                ),
-            ];
-            let valid_before: Vec<_> = barriers_before.iter().flatten().cloned().collect();
-            if !valid_before.is_empty() {
-                cmd_list.ResourceBarrier(&valid_before);
-            }
-
-            upscalers::simple::dispatch(&ctx)
-        }
+        | upscaler_type::UpscalerType::SGSR => upscalers::simple::dispatch(&ctx),
     };
 
     if result != 0 {
@@ -176,40 +156,15 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     cmd_list.RSSetScissorRects(&[full_scissor]);
     overlay::render_frame(&cmd_list, gpu, output_w, output_h);
 
-    // --- Restore barriers ---
-    // SGSRv2 upscalers already restored their input barriers internally.
-    // For simple upscalers, restore color and output.
-    match current_upscaler {
-        upscaler_type::UpscalerType::SGSRv2TwoPass | upscaler_type::UpscalerType::SGSRv2 => {
-            // Output: RT -> original FFX state
-            let barriers_after = [resource_barrier_transition_d3d12(
-                &output_res,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                ffx_state_to_d3d12(d.output.state),
-            )];
-            let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
-            if !valid_after.is_empty() {
-                cmd_list.ResourceBarrier(&valid_after);
-            }
-        }
-        _ => {
-            let barriers_after = [
-                resource_barrier_transition_d3d12(
-                    &color_res,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                    ffx_state_to_d3d12(d.color.state),
-                ),
-                resource_barrier_transition_d3d12(
-                    &output_res,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    ffx_state_to_d3d12(d.output.state),
-                ),
-            ];
-            let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
-            if !valid_after.is_empty() {
-                cmd_list.ResourceBarrier(&valid_after);
-            }
-        }
+    // --- Restore output barrier ---
+    // All upscalers leave output in RENDER_TARGET state. Restore to original FFX state.
+    let barrier = resource_barrier_transition_d3d12(
+        &output_res,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        ffx_state_to_d3d12(d.output.state),
+    );
+    if let Some(b) = barrier {
+        cmd_list.ResourceBarrier(&[b]);
     }
 
     0 // FFX_OK
