@@ -83,10 +83,6 @@ unsafe fn ensure_rcas_temp(
 /// Returns true if RCAS should be applied for the current upscaler.
 pub fn is_enabled() -> bool {
     upscaler_type::rcas_get()
-        && matches!(
-            upscaler_type::get(),
-            upscaler_type::UpscalerType::Bilinear | upscaler_type::UpscalerType::Lanczos
-        )
 }
 
 /// Apply RCAS sharpening: copy output -> temp_rt, RCAS temp_rt -> output.

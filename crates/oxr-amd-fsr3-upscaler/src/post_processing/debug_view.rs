@@ -108,6 +108,9 @@ pub unsafe fn apply(ctx: &PostContext) {
     cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
     cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
+    let rtv_output = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
+    cmd_list.OMSetRenderTargets(1, Some(&rtv_output), false, None);
+
     for (i, tile) in tiles.iter().enumerate() {
         let res = match &tile_resources[i] {
             Some(r) => r,
