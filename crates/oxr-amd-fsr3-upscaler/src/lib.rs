@@ -5,12 +5,12 @@ mod gpu_pipeline;
 mod imgui_renderer;
 mod logging;
 mod overlay;
+mod post_processing;
 #[cfg(feature = "recording")]
 mod recording;
 mod settings;
-mod sgsr2_state;
-mod sgsr2_three_pass_state;
 mod upscaler_type;
+mod upscalers;
 
 use core::ffi::c_void;
 use fsr3_types::*;
@@ -203,10 +203,6 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextGenerateReactiveMask(
     desc: *const FfxFsr3UpscalerGenerateReactiveDescription,
 ) -> u32 {
     (FN_TABLE.get().unwrap().GenReactiveMask)(ctx, desc)
-}
-
-fn is_spatial_upscaler() -> bool {
-    (upscaler_type::get() as u8) <= 2 // Bilinear=0, Lanczos=1, SGSR=2
 }
 
 #[no_mangle]

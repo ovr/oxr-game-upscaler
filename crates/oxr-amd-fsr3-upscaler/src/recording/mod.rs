@@ -711,7 +711,7 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         if raw.is_null() {
             return;
         }
-        if let Some(res) = dispatch::borrow_resource(raw) {
+        if let Some(res) = crate::upscalers::borrow_resource(raw) {
             let desc = res.GetDesc();
             let actual_w = desc.Width as u32;
             let actual_h = desc.Height;
