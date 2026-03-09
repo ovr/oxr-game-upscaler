@@ -32,6 +32,24 @@ pub unsafe fn init() {
     });
 }
 
+/// Flush pending log messages by dropping the async writer guard.
+///
+/// # Safety
+/// Must only be called once, right before a panic / abort.
+pub unsafe fn flush() {
+    // Dropping the WorkerGuard flushes and joins the background writer thread.
+    GUARD.take();
+}
+
+/// Log an error, flush the async writer, then panic.
+///
+/// Use instead of `panic!()` so the message is guaranteed on disk.
+pub fn fatal(msg: &str) -> ! {
+    tracing::error!("{msg}");
+    unsafe { flush() };
+    panic!("{msg}");
+}
+
 /// Returns the directory containing the loaded DLL.
 pub(crate) fn dll_directory() -> Option<PathBuf> {
     use windows::Win32::System::LibraryLoader::GetModuleFileNameW;

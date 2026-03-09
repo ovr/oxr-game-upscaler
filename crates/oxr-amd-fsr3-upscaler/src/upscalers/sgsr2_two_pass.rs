@@ -8,7 +8,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::super::dispatch::{
-    ffx_state_to_d3d12, resource_barrier_transition, resource_barrier_transition_d3d12,
+    apply_barriers, ffx_state_to_d3d12, resource_barrier_transition,
+    resource_barrier_transition_d3d12,
 };
 
 // --- Persistent state ---
@@ -169,33 +170,26 @@ pub unsafe fn dispatch(ctx: &DispatchContext) -> u32 {
     };
 
     // === Pass 1: Convert (render resolution) ===
-    {
-        let mut barriers = Vec::new();
-        if let Some(b) = resource_barrier_transition(
-            &depth_res,
-            d.depth.state,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers.push(b);
-        }
-        if let Some(b) = resource_barrier_transition(
-            &mv_res,
-            d.motion_vectors.state,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers.push(b);
-        }
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &state.motion_depth_clip,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-        ) {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
-    }
+    apply_barriers(
+        cmd_list,
+        &[
+            resource_barrier_transition(
+                &depth_res,
+                d.depth.state,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+            resource_barrier_transition(
+                &mv_res,
+                d.motion_vectors.state,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+            resource_barrier_transition_d3d12(
+                &state.motion_depth_clip,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ),
+        ],
+    );
 
     // Create SRVs for convert pass
     create_typed_srv(gpu, &depth_res, d.depth.description.format, SRV_DEPTH);
@@ -252,42 +246,33 @@ pub unsafe fn dispatch(ctx: &DispatchContext) -> u32 {
 
     // === Barrier: motion_depth_clip RT -> SRV, color -> SRV ===
     {
-        let mut barriers = Vec::new();
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &state.motion_depth_clip,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers.push(b);
-        }
-        if let Some(b) = resource_barrier_transition(
-            ctx.color_res,
-            d.color.state,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers.push(b);
-        }
         let prev_idx = state.frame_idx as usize;
         let curr_idx = 1 - prev_idx;
+        let mut barriers = vec![
+            resource_barrier_transition_d3d12(
+                &state.motion_depth_clip,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+            resource_barrier_transition(
+                ctx.color_res,
+                d.color.state,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+        ];
         if is_reset {
-            if let Some(b) = resource_barrier_transition_d3d12(
+            barriers.push(resource_barrier_transition_d3d12(
                 &state.history[prev_idx],
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
-            ) {
-                barriers.push(b);
-            }
+            ));
         }
-        if let Some(b) = resource_barrier_transition_d3d12(
+        barriers.push(resource_barrier_transition_d3d12(
             &state.history[curr_idx],
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
-        ) {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
+        ));
+        apply_barriers(cmd_list, &barriers);
     }
 
     let prev_idx = state.frame_idx as usize;
@@ -301,17 +286,14 @@ pub unsafe fn dispatch(ctx: &DispatchContext) -> u32 {
                 .CreateRenderTargetView(&state.history[idx], None, ctx.rtv_cpu(RTV_HISTORY));
             cmd_list.ClearRenderTargetView(ctx.rtv_cpu(RTV_HISTORY), &black, None);
         }
-        let mut barriers = Vec::new();
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &state.history[prev_idx],
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
+        apply_barriers(
+            cmd_list,
+            &[resource_barrier_transition_d3d12(
+                &state.history[prev_idx],
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )],
+        );
     }
 
     // === Pass 2: Upscale (display resolution) ===
@@ -386,84 +368,65 @@ pub unsafe fn dispatch(ctx: &DispatchContext) -> u32 {
     cmd_list.DrawInstanced(3, 1, 0, 0);
 
     // === Copy history[curr] -> output ===
-    {
-        let mut barriers = Vec::new();
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &state.history[curr_idx],
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-        ) {
-            barriers.push(b);
-        }
-        if let Some(b) = resource_barrier_transition(
-            ctx.output_res,
-            d.output.state,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        ) {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
-    }
+    apply_barriers(
+        cmd_list,
+        &[
+            resource_barrier_transition_d3d12(
+                &state.history[curr_idx],
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ),
+            resource_barrier_transition(
+                ctx.output_res,
+                d.output.state,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ],
+    );
 
     cmd_list.CopyResource(ctx.output_res, &state.history[curr_idx]);
 
     // === Transition output to RENDER_TARGET for overlay ===
-    {
-        let mut barriers = Vec::new();
-        if let Some(b) = resource_barrier_transition_d3d12(
+    apply_barriers(
+        cmd_list,
+        &[resource_barrier_transition_d3d12(
             ctx.output_res,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
-        ) {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
-    }
+        )],
+    );
 
     // Create RTV for output (slot 0) — needed for overlay and post-fx
     gpu.device
         .CreateRenderTargetView(ctx.output_res, None, ctx.rtv_cpu(0));
 
     // === Restore barriers ===
-    {
-        let mut barriers = Vec::new();
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &depth_res,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            ffx_state_to_d3d12(d.depth.state),
-        ) {
-            barriers.push(b);
-        }
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &mv_res,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            ffx_state_to_d3d12(d.motion_vectors.state),
-        ) {
-            barriers.push(b);
-        }
-        if let Some(b) = resource_barrier_transition_d3d12(
-            ctx.color_res,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            ffx_state_to_d3d12(d.color.state),
-        ) {
-            barriers.push(b);
-        }
-        // History[curr] stays as COPY_SOURCE -> transition to SRV for next frame
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &state.history[curr_idx],
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
-    }
+    apply_barriers(
+        cmd_list,
+        &[
+            resource_barrier_transition_d3d12(
+                &depth_res,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                ffx_state_to_d3d12(d.depth.state),
+            ),
+            resource_barrier_transition_d3d12(
+                &mv_res,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                ffx_state_to_d3d12(d.motion_vectors.state),
+            ),
+            resource_barrier_transition_d3d12(
+                ctx.color_res,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                ffx_state_to_d3d12(d.color.state),
+            ),
+            // History[curr] stays as COPY_SOURCE -> transition to SRV for next frame
+            resource_barrier_transition_d3d12(
+                &state.history[curr_idx],
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+        ],
+    );
 
     gpu_pipeline::log_device_removed_reason(&gpu.device);
 

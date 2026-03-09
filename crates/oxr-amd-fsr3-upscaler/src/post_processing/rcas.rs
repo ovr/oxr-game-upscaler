@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use crate::dispatch::resource_barrier_transition_d3d12;
+use crate::dispatch::{apply_barriers, resource_barrier_transition_d3d12};
 
 /// SRV slot for RCAS input.
 const SRV_RCAS: u32 = 9;
@@ -109,59 +109,44 @@ pub unsafe fn apply(ctx: &PostContext) {
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_RENDER_TARGET,
     );
-    if let Some(b) = &barrier_temp_to_rt {
-        cmd_list.ResourceBarrier(&[b.clone()]);
-    }
+    cmd_list.ResourceBarrier(&[barrier_temp_to_rt]);
 
-    // Barrier: output RT -> COPY_SOURCE
-    let barrier_output_to_copy = resource_barrier_transition_d3d12(
-        ctx.output_res,
-        D3D12_RESOURCE_STATE_RENDER_TARGET,
-        D3D12_RESOURCE_STATE_COPY_SOURCE,
+    // Barrier: output RT -> COPY_SOURCE, temp_rt RT -> COPY_DEST
+    apply_barriers(
+        cmd_list,
+        &[
+            resource_barrier_transition_d3d12(
+                ctx.output_res,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ),
+            resource_barrier_transition_d3d12(
+                &temp_rt,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ],
     );
-    // Barrier: temp_rt RT -> COPY_DEST
-    let barrier_temp_to_copy = resource_barrier_transition_d3d12(
-        &temp_rt,
-        D3D12_RESOURCE_STATE_RENDER_TARGET,
-        D3D12_RESOURCE_STATE_COPY_DEST,
-    );
-    {
-        let mut barriers = Vec::new();
-        if let Some(b) = barrier_output_to_copy {
-            barriers.push(b);
-        }
-        if let Some(b) = barrier_temp_to_copy {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
-    }
 
     // Copy output -> temp_rt
     cmd_list.CopyResource(&temp_rt, ctx.output_res);
 
     // Barrier: temp_rt COPY_DEST -> PSR, output COPY_SOURCE -> RT
-    {
-        let mut barriers = Vec::new();
-        if let Some(b) = resource_barrier_transition_d3d12(
-            &temp_rt,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        ) {
-            barriers.push(b);
-        }
-        if let Some(b) = resource_barrier_transition_d3d12(
-            ctx.output_res,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-        ) {
-            barriers.push(b);
-        }
-        if !barriers.is_empty() {
-            cmd_list.ResourceBarrier(&barriers);
-        }
-    }
+    apply_barriers(
+        cmd_list,
+        &[
+            resource_barrier_transition_d3d12(
+                &temp_rt,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+            resource_barrier_transition_d3d12(
+                ctx.output_res,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ),
+        ],
+    );
 
     // Create SRV for temp_rt at RCAS slot
     let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {

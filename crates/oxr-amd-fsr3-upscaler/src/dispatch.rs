@@ -163,9 +163,7 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
         D3D12_RESOURCE_STATE_RENDER_TARGET,
         ffx_state_to_d3d12(d.output.state),
     );
-    if let Some(b) = barrier {
-        cmd_list.ResourceBarrier(&[b]);
-    }
+    cmd_list.ResourceBarrier(&[barrier]);
 
     0 // FFX_OK
 }
@@ -218,14 +216,21 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
     let output_h = d.output.description.height;
 
     // Barriers: color -> COPY_SOURCE, output -> COPY_DEST
-    let barriers_before = [
-        resource_barrier_transition(&color_res, d.color.state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        resource_barrier_transition(&output_res, d.output.state, D3D12_RESOURCE_STATE_COPY_DEST),
-    ];
-    let valid_before: Vec<_> = barriers_before.iter().flatten().cloned().collect();
-    if !valid_before.is_empty() {
-        cmd_list.ResourceBarrier(&valid_before);
-    }
+    apply_barriers(
+        &cmd_list,
+        &[
+            resource_barrier_transition(
+                &color_res,
+                d.color.state,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ),
+            resource_barrier_transition(
+                &output_res,
+                d.output.state,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ],
+    );
 
     cmd_list.CopyResource(&output_res, &color_res);
 
@@ -233,22 +238,21 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
     let gpu = gpu_pipeline::get_or_init(&cmd_list, output_format);
 
     if let Some(gpu) = gpu {
-        let barriers_mid = [
-            resource_barrier_transition_d3d12(
-                &color_res,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ffx_state_to_d3d12(d.color.state),
-            ),
-            resource_barrier_transition_d3d12(
-                &output_res,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-            ),
-        ];
-        let valid_mid: Vec<_> = barriers_mid.iter().flatten().cloned().collect();
-        if !valid_mid.is_empty() {
-            cmd_list.ResourceBarrier(&valid_mid);
-        }
+        apply_barriers(
+            &cmd_list,
+            &[
+                resource_barrier_transition_d3d12(
+                    &color_res,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ffx_state_to_d3d12(d.color.state),
+                ),
+                resource_barrier_transition_d3d12(
+                    &output_res,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                ),
+            ],
+        );
 
         gpu.device.CreateRenderTargetView(
             &output_res,
@@ -278,32 +282,30 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
 
         overlay::render_frame(&cmd_list, gpu, output_w, output_h);
 
-        let barriers_after = [resource_barrier_transition_d3d12(
-            &output_res,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            ffx_state_to_d3d12(d.output.state),
-        )];
-        let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
-        if !valid_after.is_empty() {
-            cmd_list.ResourceBarrier(&valid_after);
-        }
-    } else {
-        let barriers_after = [
-            resource_barrier_transition_d3d12(
-                &color_res,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ffx_state_to_d3d12(d.color.state),
-            ),
-            resource_barrier_transition_d3d12(
+        apply_barriers(
+            &cmd_list,
+            &[resource_barrier_transition_d3d12(
                 &output_res,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
                 ffx_state_to_d3d12(d.output.state),
-            ),
-        ];
-        let valid_after: Vec<_> = barriers_after.iter().flatten().cloned().collect();
-        if !valid_after.is_empty() {
-            cmd_list.ResourceBarrier(&valid_after);
-        }
+            )],
+        );
+    } else {
+        apply_barriers(
+            &cmd_list,
+            &[
+                resource_barrier_transition_d3d12(
+                    &color_res,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ffx_state_to_d3d12(d.color.state),
+                ),
+                resource_barrier_transition_d3d12(
+                    &output_res,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    ffx_state_to_d3d12(d.output.state),
+                ),
+            ],
+        );
     }
 
     0 // FFX_OK
@@ -360,24 +362,38 @@ pub(crate) fn ffx_state_to_d3d12(state: u32) -> D3D12_RESOURCE_STATES {
     d3d_state
 }
 
+/// Apply a batch of barriers. Skips the call if the slice is empty.
+pub(crate) unsafe fn apply_barriers(
+    cmd_list: &ID3D12GraphicsCommandList,
+    barriers: &[D3D12_RESOURCE_BARRIER],
+) {
+    if !barriers.is_empty() {
+        cmd_list.ResourceBarrier(barriers);
+    }
+}
+
 /// Build a transition barrier from FFX state -> D3D12 target state.
+/// Panics if the resolved states are equal (redundant barrier).
 pub(crate) fn resource_barrier_transition(
     resource: &ID3D12Resource,
     state_before_ffx: u32,
     state_after: D3D12_RESOURCE_STATES,
-) -> Option<D3D12_RESOURCE_BARRIER> {
+) -> D3D12_RESOURCE_BARRIER {
     let state_before = ffx_state_to_d3d12(state_before_ffx);
     resource_barrier_transition_d3d12(resource, state_before, state_after)
 }
 
-/// Build a transition barrier between two D3D12 states, returning None if they're equal.
+/// Build a transition barrier between two D3D12 states.
+/// Panics if state_before == state_after (redundant barrier).
 pub(crate) fn resource_barrier_transition_d3d12(
     resource: &ID3D12Resource,
     state_before: D3D12_RESOURCE_STATES,
     state_after: D3D12_RESOURCE_STATES,
-) -> Option<D3D12_RESOURCE_BARRIER> {
+) -> D3D12_RESOURCE_BARRIER {
     if state_before == state_after {
-        return None;
+        crate::logging::fatal(&format!(
+            "redundant barrier: state_before == state_after ({state_before:?})"
+        ));
     }
 
     let mut barrier = D3D12_RESOURCE_BARRIER {
@@ -392,5 +408,5 @@ pub(crate) fn resource_barrier_transition_d3d12(
         StateAfter: state_after,
     });
 
-    Some(barrier)
+    barrier
 }

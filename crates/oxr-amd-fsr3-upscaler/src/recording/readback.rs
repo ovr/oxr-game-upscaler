@@ -344,9 +344,7 @@ impl ReadbackPool {
             ffx_state,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         );
-        if let Some(b) = &barrier_before {
-            cmd_list.ResourceBarrier(&[b.clone()]);
-        }
+        cmd_list.ResourceBarrier(&[barrier_before]);
 
         // CopyTextureRegion: texture → staging buffer (placed footprint)
         let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
@@ -389,9 +387,7 @@ impl ReadbackPool {
             D3D12_RESOURCE_STATE_COPY_SOURCE,
             dispatch::ffx_state_to_d3d12(ffx_state),
         );
-        if let Some(b) = &barrier_after {
-            cmd_list.ResourceBarrier(&[b.clone()]);
-        }
+        cmd_list.ResourceBarrier(&[barrier_after]);
     }
 
     /// Enqueue copy of depth plane 0 from a multi-plane depth-stencil resource.
@@ -534,26 +530,24 @@ impl ReadbackPool {
         let total_size = info.row_pitch as u64 * info.height as u64;
 
         // Transition staging: COPY_DEST → COPY_SOURCE
-        if let Some(b) = dispatch::resource_barrier_transition_d3d12(
+        let b = dispatch::resource_barrier_transition_d3d12(
             staging,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
-        ) {
-            cmd_list.ResourceBarrier(&[b]);
-        }
+        );
+        cmd_list.ResourceBarrier(&[b]);
 
         // CopyBufferRegion: staging (VRAM) → readback (system RAM, PCIe)
         // READBACK heap is implicitly always in COPY_DEST — no barrier needed.
         cmd_list.CopyBufferRegion(readback, 0, staging, 0, total_size);
 
         // Restore staging to COPY_DEST so it's ready for the next burst cycle.
-        if let Some(b) = dispatch::resource_barrier_transition_d3d12(
+        let b = dispatch::resource_barrier_transition_d3d12(
             staging,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST,
-        ) {
-            cmd_list.ResourceBarrier(&[b]);
-        }
+        );
+        cmd_list.ResourceBarrier(&[b]);
     }
 
     /// Map the readback buffer for slot+parity, copy data out row-by-row (stripping pitch

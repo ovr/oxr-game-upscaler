@@ -86,13 +86,11 @@ pub unsafe fn apply(ctx: &PostContext) {
     for tile in &tiles {
         let res = borrow_resource(tile.resource_ptr);
         if let Some(r) = &res {
-            if let Some(b) = resource_barrier_transition(
+            barriers_before.push(resource_barrier_transition(
                 r,
                 tile.ffx_state,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            ) {
-                barriers_before.push(b);
-            }
+            ));
         }
         tile_resources.push(res);
     }
@@ -168,13 +166,11 @@ pub unsafe fn apply(ctx: &PostContext) {
     let mut barriers_after = Vec::new();
     for (idx, ffx_state) in tile_ffx_states.iter().enumerate() {
         if let Some(r) = &tile_resources[idx] {
-            if let Some(b) = resource_barrier_transition_d3d12(
+            barriers_after.push(resource_barrier_transition_d3d12(
                 r,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 ffx_state_to_d3d12(*ffx_state),
-            ) {
-                barriers_after.push(b);
-            }
+            ));
         }
     }
     if !barriers_after.is_empty() {
