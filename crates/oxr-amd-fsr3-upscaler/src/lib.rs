@@ -37,12 +37,10 @@ struct FnTable {
     ) -> u32,
     GetJitterOffset: unsafe extern "C" fn(*mut f32, *mut f32, i32, i32) -> u32,
     GetJitterPhCount: unsafe extern "C" fn(i32, i32) -> i32,
-    GetRenderRes: unsafe extern "C" fn(*mut u32, *mut u32, u32, u32, u32) -> u32,
     GetSharedResDesc: unsafe extern "C" fn(
         *mut FfxFsr3UpscalerContext,
         *mut FfxFsr3UpscalerSharedResourceDescriptions,
     ) -> u32,
-    GetUpscaleRatio: unsafe extern "C" fn(u32) -> f32,
     ResourceIsNull: unsafe extern "C" fn(FfxResource) -> u32,
     SafeRelCopy: unsafe extern "C" fn(*mut c_void, *const c_void, u32),
     SafeRelPipeline: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
@@ -96,17 +94,9 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut ()) -> bool
                         hmod,
                         b"ffxFsr3UpscalerGetJitterPhaseCount\0",
                     )),
-                    GetRenderRes: std::mem::transmute(resolve(
-                        hmod,
-                        b"ffxFsr3UpscalerGetRenderResolutionFromQualityMode\0",
-                    )),
                     GetSharedResDesc: std::mem::transmute(resolve(
                         hmod,
                         b"ffxFsr3UpscalerGetSharedResourceDescriptions\0",
-                    )),
-                    GetUpscaleRatio: std::mem::transmute(resolve(
-                        hmod,
-                        b"ffxFsr3UpscalerGetUpscaleRatioFromQualityMode\0",
                     )),
                     ResourceIsNull: std::mem::transmute(resolve(
                         hmod,
@@ -236,7 +226,19 @@ pub unsafe extern "C" fn ffxFsr3UpscalerGetRenderResolutionFromQualityMode(
     dh: u32,
     qm: u32,
 ) -> u32 {
-    (FN_TABLE.get().unwrap().GetRenderRes)(ow, oh, dw, dh, qm)
+    let ratio = ffxFsr3UpscalerGetUpscaleRatioFromQualityMode(qm);
+    if ratio == 0.0 {
+        return 0x8000_0001; // FFX_ERROR_INVALID_ARGUMENT
+    }
+    let render_w = (dw as f32 / ratio) as u32;
+    let render_h = (dh as f32 / ratio) as u32;
+    if !ow.is_null() {
+        *ow = render_w;
+    }
+    if !oh.is_null() {
+        *oh = render_h;
+    }
+    0 // FFX_OK
 }
 
 #[no_mangle]
@@ -249,7 +251,14 @@ pub unsafe extern "C" fn ffxFsr3UpscalerGetSharedResourceDescriptions(
 
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerGetUpscaleRatioFromQualityMode(qm: u32) -> f32 {
-    (FN_TABLE.get().unwrap().GetUpscaleRatio)(qm)
+    match qm {
+        0 => 1.0, // NativeAA
+        1 => 1.5, // Quality
+        2 => 1.7, // Balanced
+        3 => 2.0, // Performance
+        4 => 3.0, // UltraPerformance
+        _ => 0.0,
+    }
 }
 
 #[no_mangle]
