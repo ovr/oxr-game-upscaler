@@ -280,18 +280,61 @@ pub struct FfxFsr3UpscalerGenerateReactiveDescription {
     pub flags: u32,
 }
 
-// vendor/FidelityFX-SDK-v1/sdk/include/FidelityFX/host/ffx_types.h:L931
-// Complex struct (contains FfxResourceInitData with a union). We never read its
-// fields in the proxy — only pass pointers through.
+// FfxResourceInitData — GAME ABI (differs from v1.1.4 SDK header)
+//
+// The v1.1.4 SDK header uses `size_t size` (8 bytes on x64), making the struct 24 bytes.
+// Cyberpunk's binary uses `uint32_t size` (4 bytes), making the struct 16 bytes.
+// Confirmed by hex-dumping the original DLL's ffxFsr3UpscalerGetSharedResourceDescriptions output.
+//
+//   offset  0: type_  (u32, 0=Uninitialized, 1=Buffer, 2=Value — no Invalid variant)
+//   offset  4: size   (u32, NOT size_t)
+//   offset  8: buffer (*const c_void, union with value: u8)
+//   total: 16 bytes, align 8
+#[repr(C)]
+pub struct FfxResourceInitData {
+    pub type_: u32,
+    pub size: u32,
+    pub buffer: *const c_void, // union with value: u8
+}
+
+// FfxCreateResourceDescription — GAME ABI (differs from v1.1.4 SDK header)
+//
+// The v1.1.4 SDK header has field order: heapType, resourceDescription, initialState, name, id, initData.
+// Cyberpunk's binary has initData BEFORE name and id.
+// Confirmed by hex-dumping the original DLL output: name pointers at offset 56, IDs at offset 64,
+// repeating every 72 bytes.
+//
+//   offset  0: heap_type             (u32)
+//   offset  4: resource_description  (FfxResourceDescription, 32 bytes)
+//   offset 36: initial_state         (u32, FfxResourceStates)
+//   offset 40: init_data             (FfxResourceInitData, 16 bytes)
+//   offset 56: name                  (*const u16 / wchar_t*)
+//   offset 64: id                    (u32)
+//   offset 68: [4 bytes trailing pad for struct alignment]
+//   total: 72 bytes, align 8
+#[repr(C)]
 pub struct FfxCreateResourceDescription {
-    _opaque: [u8; 0],
+    pub heap_type: u32,
+    pub resource_description: FfxResourceDescription,
+    pub initial_state: FfxResourceStates,
+    pub init_data: FfxResourceInitData,
+    pub name: *const u16,
+    pub id: u32,
+    pub _pad: u32,
 }
 
 // vendor/FidelityFX-SDK-v1/sdk/include/FidelityFX/host/ffx_fsr3upscaler.h:L237
-// Contains 3 × FfxCreateResourceDescription; passed only as a raw pointer.
+// 3 × FfxCreateResourceDescription = 216 bytes
+#[repr(C)]
 pub struct FfxFsr3UpscalerSharedResourceDescriptions {
-    _opaque: [u8; 0],
+    pub reconstructed_prev_nearest_depth: FfxCreateResourceDescription,
+    pub dilated_depth: FfxCreateResourceDescription,
+    pub dilated_motion_vectors: FfxCreateResourceDescription,
 }
+
+const _: () = assert!(std::mem::size_of::<FfxResourceInitData>() == 16);
+const _: () = assert!(std::mem::size_of::<FfxCreateResourceDescription>() == 72);
+const _: () = assert!(std::mem::size_of::<FfxFsr3UpscalerSharedResourceDescriptions>() == 216);
 
 // vendor/FidelityFX-SDK-v1/sdk/include/FidelityFX/host/ffx_fsr3upscaler.h:L256
 // FFX_FSR3UPSCALER_CONTEXT_SIZE = FFX_SDK_DEFAULT_CONTEXT_SIZE = 1024 × 128 = 131072

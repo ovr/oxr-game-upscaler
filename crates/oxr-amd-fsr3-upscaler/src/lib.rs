@@ -37,10 +37,6 @@ struct FnTable {
     ) -> u32,
     GetJitterOffset: unsafe extern "C" fn(*mut f32, *mut f32, i32, i32) -> u32,
     GetJitterPhCount: unsafe extern "C" fn(i32, i32) -> i32,
-    GetSharedResDesc: unsafe extern "C" fn(
-        *mut FfxFsr3UpscalerContext,
-        *mut FfxFsr3UpscalerSharedResourceDescriptions,
-    ) -> u32,
     ResourceIsNull: unsafe extern "C" fn(FfxResource) -> u32,
     SafeRelCopy: unsafe extern "C" fn(*mut c_void, *const c_void, u32),
     SafeRelPipeline: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
@@ -50,6 +46,7 @@ struct FnTable {
 }
 
 static FN_TABLE: OnceLock<FnTable> = OnceLock::new();
+static MAX_RENDER_SIZE: OnceLock<FfxDimensions2D> = OnceLock::new();
 
 unsafe fn resolve(module: windows::Win32::Foundation::HMODULE, name: &[u8]) -> *const c_void {
     GetProcAddress(module, PCSTR(name.as_ptr())).unwrap() as *const c_void
@@ -94,10 +91,6 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut ()) -> bool
                         hmod,
                         b"ffxFsr3UpscalerGetJitterPhaseCount\0",
                     )),
-                    GetSharedResDesc: std::mem::transmute(resolve(
-                        hmod,
-                        b"ffxFsr3UpscalerGetSharedResourceDescriptions\0",
-                    )),
                     ResourceIsNull: std::mem::transmute(resolve(
                         hmod,
                         b"ffxFsr3UpscalerResourceIsNull\0",
@@ -137,7 +130,17 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextCreate(
     ctx: *mut FfxFsr3UpscalerContext,
     desc: *const FfxFsr3UpscalerContextDescription,
 ) -> u32 {
-    info!("ffxFsr3UpscalerContextCreate");
+    if !desc.is_null() {
+        let mrs = (*desc).max_render_size;
+        info!(
+            w = mrs.width,
+            h = mrs.height,
+            "ffxFsr3UpscalerContextCreate"
+        );
+        let _ = MAX_RENDER_SIZE.set(mrs);
+    } else {
+        info!("ffxFsr3UpscalerContextCreate (null desc)");
+    }
     (FN_TABLE.get().unwrap().ContextCreate)(ctx, desc)
 }
 
@@ -243,10 +246,126 @@ pub unsafe extern "C" fn ffxFsr3UpscalerGetRenderResolutionFromQualityMode(
 
 #[no_mangle]
 pub unsafe extern "C" fn ffxFsr3UpscalerGetSharedResourceDescriptions(
-    ctx: *mut FfxFsr3UpscalerContext,
+    _ctx: *mut FfxFsr3UpscalerContext,
     desc: *mut FfxFsr3UpscalerSharedResourceDescriptions,
 ) -> u32 {
-    (FN_TABLE.get().unwrap().GetSharedResDesc)(ctx, desc)
+    use std::ptr;
+
+    // Game ABI constants (differ from v1.1.4 SDK header values)
+    const FFX_HEAP_TYPE_DEFAULT: u32 = 0;
+    const FFX_RESOURCE_TYPE_TEXTURE2D: u32 = 2;
+    const FFX_RESOURCE_STATE_UNORDERED_ACCESS: u32 = 2;
+    const FFX_RESOURCE_FLAGS_ALIASABLE: u32 = 1;
+    const FFX_RESOURCE_USAGE_UAV: u32 = 2;
+    const FFX_RESOURCE_USAGE_RT: u32 = 1;
+    const FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED: u32 = 0; // game enum: 0=Uninitialized
+    // Game's FfxSurfaceFormat enum values (older SDK, some formats missing → shifted values)
+    const R32_UINT: u32 = 7;
+    const R16G16_FLOAT: u32 = 14;
+    const R32_FLOAT: u32 = 24;
+    // Resource IDs
+    const ID_RECONSTRUCTED_PREV_NEAREST_DEPTH: u32 = 8;
+    const ID_DILATED_MOTION_VECTORS: u32 = 9;
+    const ID_DILATED_DEPTH: u32 = 10;
+
+    // Static wide-string names (null-terminated UTF-16)
+    static NAME_RECON_DEPTH: &[u16] = &{
+        const S: &str = "FSR3UPSCALER_ReconstructedPrevNearestDepth\0";
+        const N: usize = S.len();
+        let mut buf = [0u16; N];
+        let bytes = S.as_bytes();
+        let mut i = 0;
+        while i < N {
+            buf[i] = bytes[i] as u16;
+            i += 1;
+        }
+        buf
+    };
+    static NAME_DILATED_DEPTH: &[u16] = &{
+        const S: &str = "FSR3UPSCALER_DilatedDepth\0";
+        const N: usize = S.len();
+        let mut buf = [0u16; N];
+        let bytes = S.as_bytes();
+        let mut i = 0;
+        while i < N {
+            buf[i] = bytes[i] as u16;
+            i += 1;
+        }
+        buf
+    };
+    static NAME_DILATED_MVS: &[u16] = &{
+        const S: &str = "FSR3UPSCALER_DilatedVelocity\0";
+        const N: usize = S.len();
+        let mut buf = [0u16; N];
+        let bytes = S.as_bytes();
+        let mut i = 0;
+        while i < N {
+            buf[i] = bytes[i] as u16;
+            i += 1;
+        }
+        buf
+    };
+
+    let mrs = match MAX_RENDER_SIZE.get() {
+        Some(s) => s,
+        None => {
+            info!("GetSharedResourceDescriptions: MAX_RENDER_SIZE not set");
+            return 0x8000_0001; // FFX_ERROR_INVALID_ARGUMENT
+        }
+    };
+
+    let make_desc =
+        |format: u32, usage: u32, name: &[u16], id: u32| -> FfxCreateResourceDescription {
+            FfxCreateResourceDescription {
+                heap_type: FFX_HEAP_TYPE_DEFAULT,
+                resource_description: FfxResourceDescription {
+                    type_: FFX_RESOURCE_TYPE_TEXTURE2D,
+                    format,
+                    width: mrs.width,
+                    height: mrs.height,
+                    depth: 1,
+                    mip_count: 1,
+                    flags: FFX_RESOURCE_FLAGS_ALIASABLE,
+                    usage,
+                },
+                initial_state: FFX_RESOURCE_STATE_UNORDERED_ACCESS,
+                init_data: FfxResourceInitData {
+                    type_: FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED,
+                    size: 0,
+                    buffer: ptr::null(),
+                },
+                name: name.as_ptr(),
+                id,
+                _pad: 0,
+            }
+        };
+
+    let out = &mut *desc;
+    out.reconstructed_prev_nearest_depth = make_desc(
+        R32_UINT,
+        FFX_RESOURCE_USAGE_UAV,
+        NAME_RECON_DEPTH,
+        ID_RECONSTRUCTED_PREV_NEAREST_DEPTH,
+    );
+    out.dilated_depth = make_desc(
+        R32_FLOAT,
+        FFX_RESOURCE_USAGE_RT | FFX_RESOURCE_USAGE_UAV,
+        NAME_DILATED_DEPTH,
+        ID_DILATED_DEPTH,
+    );
+    out.dilated_motion_vectors = make_desc(
+        R16G16_FLOAT,
+        FFX_RESOURCE_USAGE_RT | FFX_RESOURCE_USAGE_UAV,
+        NAME_DILATED_MVS,
+        ID_DILATED_MOTION_VECTORS,
+    );
+
+    info!(
+        w = mrs.width,
+        h = mrs.height,
+        "GetSharedResourceDescriptions (standalone)"
+    );
+    0 // FFX_OK
 }
 
 #[no_mangle]
