@@ -259,7 +259,7 @@ pub unsafe extern "C" fn ffxFsr3UpscalerGetSharedResourceDescriptions(
     const FFX_RESOURCE_USAGE_UAV: u32 = 2;
     const FFX_RESOURCE_USAGE_RT: u32 = 1;
     const FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED: u32 = 0; // game enum: 0=Uninitialized
-    // Game's FfxSurfaceFormat enum values (older SDK, some formats missing → shifted values)
+                                                              // Game's FfxSurfaceFormat enum values (older SDK, some formats missing → shifted values)
     const R32_UINT: u32 = 7;
     const R16G16_FLOAT: u32 = 14;
     const R32_FLOAT: u32 = 24;

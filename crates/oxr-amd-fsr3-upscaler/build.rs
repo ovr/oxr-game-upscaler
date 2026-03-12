@@ -2,7 +2,7 @@ use hassle_rs::*;
 use std::path::Path;
 
 fn main() {
-    let shader_dir = Path::new("src/alg-scale");
+    let shader_dir = Path::new("src/upscalers/shaders");
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     let shaders: &[(&str, &str, &str)] = &[
