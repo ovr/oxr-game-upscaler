@@ -6,20 +6,20 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     let shaders: &[(&str, &str, &str)] = &[
-        ("blit_vs.hlsl", "VS", "vs_6_0"),
-        ("blit_ps.hlsl", "PS", "ps_6_0"),
-        ("lanczos_ps.hlsl", "PS", "ps_6_0"),
-        ("debug_ps.hlsl", "PS", "ps_6_0"),
-        ("SGSRv1/sgsr_ps.hlsl", "PS", "ps_6_0"),
-        ("rcas_ps.hlsl", "PS", "ps_6_0"),
-        ("SGSRv2/2PassFS/sgsr2_vs.hlsl", "VS", "vs_6_0"),
-        ("SGSRv2/2PassFS/sgsr2_convert_ps.hlsl", "PS", "ps_6_0"),
-        ("SGSRv2/2PassFS/sgsr2_upscale_ps.hlsl", "PS", "ps_6_0"),
-        ("SGSRv2/3Pass/sgsr2_3p_convert_ps.hlsl", "PS", "ps_6_0"),
-        ("SGSRv2/3Pass/sgsr2_3p_activate_ps.hlsl", "PS", "ps_6_0"),
-        ("SGSRv2/3Pass/sgsr2_3p_upscale_ps.hlsl", "PS", "ps_6_0"),
-        ("imgui_vs.hlsl", "VS", "vs_6_0"),
-        ("imgui_ps.hlsl", "PS", "ps_6_0"),
+        ("blit_vs.hlsl", "VS", "vs_6_2"),
+        ("blit_ps.hlsl", "PS", "ps_6_2"),
+        ("lanczos_ps.hlsl", "PS", "ps_6_2"),
+        ("debug_ps.hlsl", "PS", "ps_6_2"),
+        ("SGSRv1/sgsr_ps.hlsl", "PS", "ps_6_2"),
+        ("rcas_ps.hlsl", "PS", "ps_6_2"),
+        ("SGSRv2/2PassFS/sgsr2_vs.hlsl", "VS", "vs_6_2"),
+        ("SGSRv2/2PassFS/sgsr2_convert_ps.hlsl", "PS", "ps_6_2"),
+        ("SGSRv2/2PassFS/sgsr2_upscale_ps.hlsl", "PS", "ps_6_2"),
+        ("SGSRv2/3Pass/sgsr2_3p_convert_ps.hlsl", "PS", "ps_6_2"),
+        ("SGSRv2/3Pass/sgsr2_3p_activate_ps.hlsl", "PS", "ps_6_2"),
+        ("SGSRv2/3Pass/sgsr2_3p_upscale_ps.hlsl", "PS", "ps_6_2"),
+        ("imgui_vs.hlsl", "VS", "vs_6_2"),
+        ("imgui_ps.hlsl", "PS", "ps_6_2"),
     ];
 
     let dxc = Dxc::new(None).expect("Failed to load DXC library");
@@ -41,7 +41,15 @@ fn main() {
             .create_blob_with_encoding_from_str(&source)
             .unwrap_or_else(|e| panic!("Failed to create blob for {}: {}", src_path, e));
 
-        let result = compiler.compile(&blob, src_path, entry, profile, &["-O3"], None, &[]);
+        let result = compiler.compile(
+            &blob,
+            src_path,
+            entry,
+            profile,
+            &["-O3", "-enable-16bit-types"],
+            None,
+            &[],
+        );
 
         let dxc_result = match result {
             Ok(r) => r,

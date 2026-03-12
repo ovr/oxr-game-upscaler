@@ -37,26 +37,26 @@ struct VSOut
     float2 uv  : TEXCOORD0;
 };
 
-float FastLanczos(float base)
+half FastLanczos(half base)
 {
-    float y = base - 1.0;
-    float y2 = y * y;
-    float y_temp = 0.75 * y + y2;
+    half y = base - 1.0h;
+    half y2 = y * y;
+    half y_temp = 0.75h * y + y2;
     return y_temp * y2;
 }
 
 // Decode packed 11-11-10 YCoCg uint → tonemapped RGB [0,1]
-float3 DecodeColorRGB(uint sample32)
+half3 DecodeColorRGB(uint sample32)
 {
     uint x11 = sample32 >> 21;
     uint y11 = sample32 & (2047 << 10);
     uint z10 = sample32 & 1023;
-    float Y  = (float)x11 * (1.0 / 2047.5);
-    float Co = (float)y11 * 4.76953602e-7 - 0.5;
-    float Cg = (float)z10 * (1.0 / 1023.5) - 0.5;
+    half Y  = (half)x11 * (1.0h / 2047.5h);
+    half Co = (half)y11 * 4.76953602e-7h - 0.5h;
+    half Cg = (half)z10 * (1.0h / 1023.5h) - 0.5h;
     // YCoCg → RGB (saturate: tonemapped values should be in [0,1])
-    float tmp = Y - Cg;
-    return saturate(float3(tmp + Co, Y + Cg, tmp - Co));
+    half tmp = Y - Cg;
+    return saturate(half3(tmp + Co, Y + Cg, tmp - Co));
 }
 
 struct PSOut {
@@ -94,10 +94,10 @@ PSOut PS(VSOut input)
     // Read history (already tonemapped RGB + Wfactor from previous frame's SV_Target0)
     float4 History = PrevHistoryOutput.SampleLevel(samp, PrevUV, 0);
     float Wfactor = max(saturate(abs(History.w)), alphamask);
-    float3 HistoryColor = History.xyz;  // already tonemapped [0,1]
+    half3 HistoryColor = (half3)History.xyz;  // already tonemapped [0,1]
 
     // Upsample and compute bounding box (all in tonemapped-RGB space)
-    float4 Upsampledcw = float4(0, 0, 0, 0);
+    half4 Upsampledcw = half4(0.0h, 0.0h, 0.0h, 0.0h);
     float kernelfactor = saturate(Wfactor + ValidReset);
     float biasmax = Biasmax_viewportXScale - Biasmax_viewportXScale * kernelfactor;
     float biasmin = max(1.0, 0.3 + 0.3 * biasmax);
@@ -106,9 +106,9 @@ PSOut PS(VSOut input)
     float motion_viewport_len = length(Motion * outputSize);
     float curvebias = lerp(-2.0, -3.0, saturate(motion_viewport_len * 0.02));
 
-    float3 rectboxcenter = float3(0, 0, 0);
-    float3 rectboxvar = float3(0, 0, 0);
-    float rectboxweight = 0.0;
+    half3 rectboxcenter = half3(0.0h, 0.0h, 0.0h);
+    half3 rectboxvar = half3(0.0h, 0.0h, 0.0h);
+    half rectboxweight = 0.0h;
 
     float2 srcpos = float2(InputPos) + float2(0.5, 0.5) - jitterOffset;
     float2 srcOutputPos = Hruv * renderSize;
@@ -126,87 +126,87 @@ PSOut PS(VSOut input)
     topRight = YCoCgColor.GatherRed(pointSamp, gatherCoord + float2(renderSizeRcp.x, 0.0)).yz;
     bottomLeft = YCoCgColor.GatherRed(pointSamp, gatherCoord + float2(0.0, renderSizeRcp.y)).xy;
 
-    float3 rectboxmin;
-    float3 rectboxmax;
-    float3 centerSample; // save for NaN fallback
+    half3 rectboxmin;
+    half3 rectboxmax;
+    half3 centerSample; // save for NaN fallback
 
     // Sample 0: (0, +1)
     {
-        float3 samplecolor = DecodeColorRGB(bottomLeft.y);
+        half3 samplecolor = DecodeColorRGB(bottomLeft.y);
         float2 baseoffset = srcpos_srcOutputPos + float2(0.0, 1.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw = float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw = half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = samplecolor;
         rectboxmax = samplecolor;
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter = wsample;
         rectboxvar = samplecolor * wsample;
         rectboxweight = boxweight;
     }
     // Sample 1: (+1, 0)
     {
-        float3 samplecolor = DecodeColorRGB(topRight.x);
+        half3 samplecolor = DecodeColorRGB(topRight.x);
         float2 baseoffset = srcpos_srcOutputPos + float2(1.0, 0.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
     }
     // Sample 2: (-1, 0)
     {
-        float3 samplecolor = DecodeColorRGB(topleft.x);
+        half3 samplecolor = DecodeColorRGB(topleft.x);
         float2 baseoffset = srcpos_srcOutputPos + float2(-1.0, 0.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
     }
     // Sample 3: center (0, 0)
     {
-        float3 samplecolor = DecodeColorRGB(topleft.y);
+        half3 samplecolor = DecodeColorRGB(topleft.y);
         centerSample = samplecolor;
         float2 baseoffset = srcpos_srcOutputPos;
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
     }
     // Sample 4: (0, -1)
     {
-        float3 samplecolor = DecodeColorRGB(topleft.z);
+        half3 samplecolor = DecodeColorRGB(topleft.z);
         float2 baseoffset = srcpos_srcOutputPos + float2(0.0, -1.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
@@ -214,79 +214,79 @@ PSOut PS(VSOut input)
     // Sample 5: (+1, +1)
     {
         uint btmRight = YCoCgColor[InputPosBtmRight].x;
-        float3 samplecolor = DecodeColorRGB(btmRight);
+        half3 samplecolor = DecodeColorRGB(btmRight);
         float2 baseoffset = srcpos_srcOutputPos + float2(1.0, 1.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
     }
     // Sample 6: (-1, +1)
     {
-        float3 samplecolor = DecodeColorRGB(bottomLeft.x);
+        half3 samplecolor = DecodeColorRGB(bottomLeft.x);
         float2 baseoffset = srcpos_srcOutputPos + float2(-1.0, 1.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
     }
     // Sample 7: (+1, -1)
     {
-        float3 samplecolor = DecodeColorRGB(topRight.y);
+        half3 samplecolor = DecodeColorRGB(topRight.y);
         float2 baseoffset = srcpos_srcOutputPos + float2(1.0, -1.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
     }
     // Sample 8: (-1, -1)
     {
-        float3 samplecolor = DecodeColorRGB(topleft.w);
+        half3 samplecolor = DecodeColorRGB(topleft.w);
         float2 baseoffset = srcpos_srcOutputPos + float2(-1.0, -1.0);
         float baseoffset_dot = dot(baseoffset, baseoffset);
-        float base = clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
-        float weight = FastLanczos(base);
-        Upsampledcw += float4(samplecolor * weight, weight);
-        float boxweight = exp(baseoffset_dot * curvebias);
+        half base = (half)clamp(baseoffset_dot * kernelbias2, 0.0, 1.0);
+        half weight = FastLanczos(base);
+        Upsampledcw += half4(samplecolor * weight, weight);
+        half boxweight = (half)exp(baseoffset_dot * curvebias);
         rectboxmin = min(rectboxmin, samplecolor);
         rectboxmax = max(rectboxmax, samplecolor);
-        float3 wsample = samplecolor * boxweight;
+        half3 wsample = samplecolor * boxweight;
         rectboxcenter += wsample;
         rectboxvar += samplecolor * wsample;
         rectboxweight += boxweight;
     }
 
     // Normalize bounding box
-    rectboxweight = max(rectboxweight, 1e-6);
-    rectboxweight = 1.0 / rectboxweight;
+    rectboxweight = max(rectboxweight, 1e-6h);
+    rectboxweight = 1.0h / rectboxweight;
     rectboxcenter *= rectboxweight;
     rectboxvar *= rectboxweight;
     rectboxvar = sqrt(abs(rectboxvar - rectboxcenter * rectboxcenter));
 
-    float3 bias = float3(0.075, 0.075, 0.075);
-    float div_w = Upsampledcw.w;
-    if (abs(div_w) < 0.001) div_w = 0.001;
+    half3 bias = half3(0.075h, 0.075h, 0.075h);
+    half div_w = Upsampledcw.w;
+    if (abs(div_w) < 0.001h) div_w = 0.001h;
     Upsampledcw.xyz = Upsampledcw.xyz / div_w;
     // Guard NaN/Inf from division
     if (any(isnan(Upsampledcw.xyz)) || any(isinf(Upsampledcw.xyz)))
@@ -295,40 +295,40 @@ PSOut PS(VSOut input)
     // Guard NaN from rectbox clamp (NaN bounds propagate on some GPUs)
     if (any(isnan(Upsampledcw.xyz)))
         Upsampledcw.xyz = centerSample;
-    Upsampledcw.w = max(abs(Upsampledcw.w), 0.001) * (1.0 / 3.0);
+    Upsampledcw.w = max(abs(Upsampledcw.w), 0.001h) * (1.0h / 3.0h);
 
-    float tcontribute = history_value * saturate(rectboxvar.x * 10.0);
-    float OneMinusWfactor = 1.0 - Wfactor;
+    half tcontribute = (half)history_value * saturate(rectboxvar.x * 10.0h);
+    half OneMinusWfactor = 1.0h - (half)Wfactor;
     tcontribute = tcontribute * OneMinusWfactor;
 
-    float baseupdate = OneMinusWfactor - OneMinusWfactor * depthfactor;
-    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w * 10.0, saturate(10.0 * motion_viewport_len)));
-    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w, saturate(motion_viewport_len * 0.05)));
-    float basealpha = baseupdate;
+    half baseupdate = OneMinusWfactor - OneMinusWfactor * (half)depthfactor;
+    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w * 10.0h, saturate((half)(10.0 * motion_viewport_len))));
+    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w, saturate((half)(motion_viewport_len * 0.05))));
+    half basealpha = baseupdate;
 
-    const float EPS = 1.192e-07;
-    float boxscale = max(depthfactor, saturate(motion_viewport_len * 0.05));
-    float boxsize = lerp(Scalefactor, 1.0, boxscale);
+    const half EPS = 1.192e-07h;
+    half boxscale = max((half)depthfactor, saturate((half)(motion_viewport_len * 0.05)));
+    half boxsize = lerp((half)Scalefactor, 1.0h, boxscale);
 
-    float3 sboxvar = rectboxvar * boxsize;
-    float3 boxmin = rectboxcenter - sboxvar;
-    float3 boxmax = rectboxcenter + sboxvar;
+    half3 sboxvar = rectboxvar * boxsize;
+    half3 boxmin = rectboxcenter - sboxvar;
+    half3 boxmax = rectboxcenter + sboxvar;
     rectboxmax = min(rectboxmax, boxmax);
     rectboxmin = max(rectboxmin, boxmin);
 
     // Clamp tonemapped history against tonemapped-RGB rectbox
-    float3 clampedcolor = clamp(HistoryColor, rectboxmin, rectboxmax);
-    float lerpcontribution = (any(rectboxmin > HistoryColor) || any(HistoryColor > rectboxmax)) ? tcontribute : 1.0;
-    lerpcontribution = lerpcontribution - lerpcontribution * sqrt(alphamask);
+    half3 clampedcolor = clamp(HistoryColor, rectboxmin, rectboxmax);
+    half lerpcontribution = (any(rectboxmin > HistoryColor) || any(HistoryColor > rectboxmax)) ? tcontribute : 1.0h;
+    lerpcontribution = lerpcontribution - lerpcontribution * (half)sqrt(alphamask);
 
     HistoryColor = lerp(clampedcolor, HistoryColor, saturate(lerpcontribution));
-    float basemin = min(basealpha, 0.1);
+    half basemin = min(basealpha, 0.1h);
     basealpha = lerp(basemin, basealpha, saturate(lerpcontribution));
 
     // Blend current frame with history (both in tonemapped-RGB space)
-    float alphasum = max(EPS, basealpha + Upsampledcw.w);
-    float alpha = saturate(Upsampledcw.w / alphasum + ValidReset);
-    float3 blended = lerp(HistoryColor, Upsampledcw.xyz, alpha);
+    half alphasum = max(EPS, basealpha + Upsampledcw.w);
+    half alpha = saturate(Upsampledcw.w / alphasum + (half)ValidReset);
+    half3 blended = lerp(HistoryColor, Upsampledcw.xyz, alpha);
 
     // NaN guard on blended
     if (any(isnan(blended)) || any(isinf(blended)))
@@ -336,10 +336,11 @@ PSOut PS(VSOut input)
 
     // SV_Target0: tonemapped for history (stable, bounded [0,1])
     PSOut o;
-    o.history = float4(blended, Wfactor);
+    o.history = float4((float3)blended, Wfactor);
 
     // SV_Target1: inverse tonemap for scene output (HDR)
-    float compMax = max(blended.x, max(blended.y, blended.z));
+    float3 blended_f = (float3)blended;
+    float compMax = max(blended_f.x, max(blended_f.y, blended_f.z));
     float scale;
     if (bright > 1000.0)
     {
@@ -351,7 +352,7 @@ PSOut PS(VSOut input)
         compMax = clamp(compMax, 0.0, 254.0 / 255.0);
         scale = Exposure_co_rcp / ((1.0 + 1.0 / 65504.0) - compMax);
     }
-    float3 rgb = blended * scale;
+    float3 rgb = blended_f * scale;
     if (any(isnan(rgb)) || any(isinf(rgb)))
         rgb = float3(0, 0, 0);
     o.scene = float4(rgb, 1.0);

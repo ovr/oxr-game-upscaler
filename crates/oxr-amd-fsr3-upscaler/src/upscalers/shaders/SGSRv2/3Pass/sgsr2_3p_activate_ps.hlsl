@@ -157,7 +157,7 @@ PSOut PS(VSOut input)
     depthclip = depthclip + depth_base;
 
     PSOut o;
-    o.mdca = float4(motion, depthclip, alphamask);
+    o.mdca = (half4)float4(motion, depthclip, alphamask);
     o.luma = pack;
     return o;
 }

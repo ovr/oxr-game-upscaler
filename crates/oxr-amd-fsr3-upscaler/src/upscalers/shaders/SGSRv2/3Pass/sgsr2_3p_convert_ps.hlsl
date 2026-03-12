@@ -90,32 +90,32 @@ PSOut PS(VSOut input)
     }
 
     // Read scene color and tonemap
-    float3 Colorrgb = InputColor.Load(int3(InputPos, 0)).xyz;
+    half3 Colorrgb = (half3)InputColor.Load(int3(InputPos, 0)).xyz;
 
     // Simple tonemap: divide by max component + exposure reciprocal
     float Exposure_co_rcp = preExposure;
-    float ColorMax = max(max(Colorrgb.x, Colorrgb.y), Colorrgb.z) + Exposure_co_rcp;
+    half ColorMax = max(max(Colorrgb.x, Colorrgb.y), Colorrgb.z) + (half)Exposure_co_rcp;
     Colorrgb /= ColorMax;
 
     // Encode brightness into depth (integer part = brightness * 0.001, fractional = depth)
-    float depth_bright = floor(ColorMax * 0.001) + NearestZ;
+    float depth_bright = floor((float)ColorMax * 0.001) + NearestZ;
 
     // RGB → YCoCg conversion (all values in [0,1] range)
-    float3 Colorycocg;
-    Colorycocg.x = 0.25 * (Colorrgb.x + 2.0 * Colorrgb.y + Colorrgb.z);
-    Colorycocg.y = saturate(0.5 * Colorrgb.x + 0.5 - 0.5 * Colorrgb.z);
+    half3 Colorycocg;
+    Colorycocg.x = 0.25h * (Colorrgb.x + 2.0h * Colorrgb.y + Colorrgb.z);
+    Colorycocg.y = saturate(0.5h * Colorrgb.x + 0.5h - 0.5h * Colorrgb.z);
     Colorycocg.z = saturate(Colorycocg.x + Colorycocg.y - Colorrgb.x);
 
     // Pack YCoCg into 11-11-10 uint
-    uint x11 = (uint)(Colorycocg.x * 2047.5);
-    uint y11 = (uint)(Colorycocg.y * 2047.5);
-    uint z10 = (uint)(Colorycocg.z * 1023.5);
+    uint x11 = (uint)(Colorycocg.x * 2047.5h);
+    uint y11 = (uint)(Colorycocg.y * 2047.5h);
+    uint z10 = (uint)(Colorycocg.z * 1023.5h);
 
     // No InputOpaqueColor available from Cyberpunk — set alpha_mask = 0
-    float alpha_mask = 0.0;
+    half alpha_mask = 0.0h;
 
     PSOut o;
     o.ycocg = (x11 << 21) | (y11 << 10) | z10;
-    o.mda = float4(motion, depth_bright, alpha_mask);
+    o.mda = (half4)float4(motion, depth_bright, (float)alpha_mask);
     return o;
 }
