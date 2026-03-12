@@ -395,7 +395,7 @@ unsafe fn create_sgsr2_root_signature(
 ) -> Result<ID3D12RootSignature, String> {
     // 32 root constants (b0): clipToPrevClip[4] (16) + renderSize (2) + outputSize (2)
     // + renderSizeRcp (2) + outputSizeRcp (2) + jitterOffset (2) + scaleRatio (2)
-    // + cameraFovAngleHor (1) + minLerpContribution (1) + reset (1) + bSameCamera (1) = 32
+    // + cameraFovAngleVertical (1) + minLerpContribution (1) + reset (1) + bSameCamera (1) = 32
     let constants = D3D12_ROOT_CONSTANTS {
         ShaderRegister: 0,
         RegisterSpace: 0,

@@ -280,6 +280,24 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
         let rtv_handle = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
         cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
 
+        // --- Post-processing chain ---
+        let post_ctx = PostContext {
+            cmd_list: &cmd_list,
+            gpu,
+            d,
+            output_res: &output_res,
+            output_w,
+            output_h,
+        };
+
+        if post_processing::rcas::is_enabled() {
+            post_processing::rcas::apply(&post_ctx);
+        }
+
+        if post_processing::debug_view::is_enabled() {
+            post_processing::debug_view::apply(&post_ctx);
+        }
+
         overlay::render_frame(&cmd_list, gpu, output_w, output_h);
 
         apply_barriers(
