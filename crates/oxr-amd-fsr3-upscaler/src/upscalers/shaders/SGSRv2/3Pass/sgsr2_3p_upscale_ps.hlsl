@@ -49,10 +49,10 @@ half FastLanczos(half base)
 half3 DecodeColorRGB(uint sample32)
 {
     uint x11 = sample32 >> 21;
-    uint y11 = sample32 & (2047 << 10);
+    uint y11 = (sample32 >> 10) & 2047;
     uint z10 = sample32 & 1023;
     half Y  = (half)x11 * (1.0h / 2047.5h);
-    half Co = (half)y11 * 4.76953602e-7h - 0.5h;
+    half Co = (half)y11 * (1.0h / 2047.5h) - 0.5h;
     half Cg = (half)z10 * (1.0h / 1023.5h) - 0.5h;
     // YCoCg → RGB (saturate: tonemapped values should be in [0,1])
     half tmp = Y - Cg;
