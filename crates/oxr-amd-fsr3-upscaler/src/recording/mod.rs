@@ -277,6 +277,10 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                                 .pool
                                 .get_deferred_readback(Slot::MotionVectors, idx)
                                 .map(|rb| DeferredTextureData { readback: rb });
+                            let reactive = state
+                                .pool
+                                .get_deferred_readback(Slot::Reactive, idx)
+                                .map(|rb| DeferredTextureData { readback: rb });
 
                             let estimated_bytes = color
                                 .as_ref()
@@ -285,6 +289,9 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                                     .as_ref()
                                     .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
                                 + motion_vectors
+                                    .as_ref()
+                                    .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
+                                + reactive
                                     .as_ref()
                                     .map_or(0, |d| estimate_slot_bytes(&d.readback.info));
 
@@ -295,6 +302,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                                 color,
                                 depth,
                                 motion_vectors,
+                                reactive,
                                 metadata,
                             };
 
@@ -446,6 +454,10 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 .pool
                 .get_deferred_readback(Slot::MotionVectors, idx)
                 .map(|rb| DeferredTextureData { readback: rb });
+            let reactive = state
+                .pool
+                .get_deferred_readback(Slot::Reactive, idx)
+                .map(|rb| DeferredTextureData { readback: rb });
 
             let estimated_bytes = color
                 .as_ref()
@@ -454,6 +466,9 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                     .as_ref()
                     .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
                 + motion_vectors
+                    .as_ref()
+                    .map_or(0, |d| estimate_slot_bytes(&d.readback.info))
+                + reactive
                     .as_ref()
                     .map_or(0, |d| estimate_slot_bytes(&d.readback.info));
 
@@ -464,6 +479,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
                 color,
                 depth,
                 motion_vectors,
+                reactive,
                 metadata,
             };
 
@@ -555,6 +571,10 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         .pool
         .map_and_extract(Slot::MotionVectors, prev_parity)
         .map(|(info, data)| TextureData { data, info });
+    let reactive = state
+        .pool
+        .map_and_extract(Slot::Reactive, prev_parity)
+        .map(|(info, data)| TextureData { data, info });
 
     let metadata = FrameMetadata {
         jitter_x: d.jitter_offset.x,
@@ -576,7 +596,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
 
     let packet_bytes = color.as_ref().map_or(0, |t| t.data.len() as u64)
         + depth.as_ref().map_or(0, |t| t.data.len() as u64)
-        + motion_vectors.as_ref().map_or(0, |t| t.data.len() as u64);
+        + motion_vectors.as_ref().map_or(0, |t| t.data.len() as u64)
+        + reactive.as_ref().map_or(0, |t| t.data.len() as u64);
 
     let packet = FramePacket {
         frame_number: state.frame_number,
@@ -585,6 +606,7 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         color,
         depth,
         motion_vectors,
+        reactive,
         metadata,
     };
 
@@ -672,8 +694,13 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
             if expected == 0 || state.pool.read_marker(idx) != Some(expected) {
                 continue; // staging copy not yet done
             }
-            // Enqueue VRAM→READBACK for all 3 slots
-            for slot in [Slot::Color, Slot::Depth, Slot::MotionVectors] {
+            // Enqueue VRAM→READBACK for all 4 slots
+            for slot in [
+                Slot::Color,
+                Slot::Depth,
+                Slot::MotionVectors,
+                Slot::Reactive,
+            ] {
                 state.pool.enqueue_staging_to_readback(&cmd_list, slot, idx);
             }
             // Write readback-done marker (signals CPU that PCIe copy is complete)
@@ -783,6 +810,15 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         d.motion_vectors.state,
         d.motion_vectors.description.width,
         d.motion_vectors.description.height,
+    );
+
+    // Reactive mask
+    copy_slot(
+        Slot::Reactive,
+        d.reactive.resource,
+        d.reactive.state,
+        d.reactive.description.width,
+        d.reactive.description.height,
     );
 
     // Write GPU completion marker after all copies

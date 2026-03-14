@@ -20,6 +20,7 @@ pub struct DeferredFramePacket {
     pub color: Option<DeferredTextureData>,
     pub depth: Option<DeferredTextureData>,
     pub motion_vectors: Option<DeferredTextureData>,
+    pub reactive: Option<DeferredTextureData>,
     pub metadata: FrameMetadata,
 }
 
@@ -75,10 +76,12 @@ fn extractor_loop(rx: &mpsc::Receiver<ExtractorMessage>, writer_tx: &mpsc::Sende
                 let color = extract_slot(deferred.color, "color");
                 let depth = extract_slot(deferred.depth, "depth");
                 let motion_vectors = extract_slot(deferred.motion_vectors, "mv");
+                let reactive = extract_slot(deferred.reactive, "reactive");
 
                 let packet_bytes = color.as_ref().map_or(0, |t| t.data.len() as u64)
                     + depth.as_ref().map_or(0, |t| t.data.len() as u64)
-                    + motion_vectors.as_ref().map_or(0, |t| t.data.len() as u64);
+                    + motion_vectors.as_ref().map_or(0, |t| t.data.len() as u64)
+                    + reactive.as_ref().map_or(0, |t| t.data.len() as u64);
 
                 // Correct the estimate → actual difference in QUEUED_BYTES
                 if packet_bytes > estimated {
@@ -94,6 +97,7 @@ fn extractor_loop(rx: &mpsc::Receiver<ExtractorMessage>, writer_tx: &mpsc::Sende
                     color,
                     depth,
                     motion_vectors,
+                    reactive,
                     metadata: deferred.metadata,
                 };
 

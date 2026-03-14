@@ -64,6 +64,7 @@ pub struct FramePacket {
     pub color: Option<TextureData>,
     pub depth: Option<TextureData>,
     pub motion_vectors: Option<TextureData>,
+    pub reactive: Option<TextureData>,
     pub metadata: FrameMetadata,
 }
 
@@ -188,6 +189,11 @@ fn write_frame(session_dir: &PathBuf, packet: &FramePacket) -> Result<(), String
     // Write motion vectors EXR
     if let Some(tex) = &packet.motion_vectors {
         write_mv_exr(&fname("mv", "exr"), tex)?;
+    }
+
+    // Write reactive mask EXR
+    if let Some(tex) = &packet.reactive {
+        write_reactive_exr(&fname("reactive", "exr"), tex)?;
     }
 
     // Write metadata JSON
@@ -652,6 +658,59 @@ fn write_mv_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let size_mb = buf.len() as f64 / (1024.0 * 1024.0);
     info!(
         "writer: mv convert={:.1}ms downscale={:.1}ms compress={:.1}ms io={:.1}ms ({:.1}MB)",
+        convert_ms, downscale_ms, compress_ms, io_ms, size_mb,
+    );
+    Ok(())
+}
+
+fn write_reactive_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
+    let mut w = tex.info.width as usize;
+    let mut h = tex.info.height as usize;
+
+    let t0 = Instant::now();
+    let mut reactive = convert_to_r_f32(tex);
+    let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let mut downscale_ms = 0.0;
+    if should_downscale(w, h) {
+        let t1 = Instant::now();
+        let (nw, nh, scaled) = downscale_2x(&reactive, w, h, 1);
+        downscale_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        w = nw;
+        h = nh;
+        reactive = scaled;
+    }
+
+    use exr::prelude::*;
+
+    let channel = AnyChannel::new("Y", FlatSamples::F32(reactive));
+    let channels = AnyChannels::sort(smallvec![channel]);
+    let layer = Layer::new(
+        (w, h),
+        LayerAttributes::named("reactive"),
+        Encoding {
+            compression: Compression::ZIP16,
+            ..Default::default()
+        },
+        channels,
+    );
+    let image = Image::from_layer(layer);
+
+    let t2 = Instant::now();
+    let mut buf = Vec::with_capacity(EXR_DEPTH_BUF_CAPACITY);
+    image
+        .write()
+        .to_buffered(std::io::Cursor::new(&mut buf))
+        .map_err(|e| format!("write reactive EXR: {}", e))?;
+    let compress_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+    let t3 = Instant::now();
+    std::fs::write(path, &buf).map_err(|e| format!("write reactive EXR: {}", e))?;
+    let io_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+    let size_mb = buf.len() as f64 / (1024.0 * 1024.0);
+    info!(
+        "writer: reactive convert={:.1}ms downscale={:.1}ms compress={:.1}ms io={:.1}ms ({:.1}MB)",
         convert_ms, downscale_ms, compress_ms, io_ms, size_mb,
     );
     Ok(())

@@ -25,9 +25,10 @@ pub enum Slot {
     Color = 0,
     Depth = 1,
     MotionVectors = 2,
+    Reactive = 3,
 }
 
-const NUM_SLOTS: usize = 3;
+const NUM_SLOTS: usize = 4;
 const NUM_PARITY: usize = 8;
 
 /// Info about a readback buffer's layout.
