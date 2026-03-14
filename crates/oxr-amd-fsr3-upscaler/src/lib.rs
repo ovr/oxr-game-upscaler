@@ -195,6 +195,7 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextGenerateReactiveMask(
     ctx: *mut FfxFsr3UpscalerContext,
     desc: *const FfxFsr3UpscalerGenerateReactiveDescription,
 ) -> u32 {
+    info!("ffxFsr3UpscalerContextGenerateReactiveMask called");
     (FN_TABLE.get().unwrap().GenReactiveMask)(ctx, desc)
 }
 

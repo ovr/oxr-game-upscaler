@@ -430,6 +430,11 @@ fn convert_to_r_f32(tex: &TextureData) -> Vec<f32> {
                 ]);
             }
         }
+        DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_TYPELESS => {
+            for i in 0..pixel_count {
+                out[i] = tex.data[i] as f32 / 255.0;
+            }
+        }
         _ => {
             error!(
                 "writer: unsupported depth format {:?}, filling zeros",
@@ -670,6 +675,10 @@ fn write_reactive_exr(path: &PathBuf, tex: &TextureData) -> Result<(), String> {
     let t0 = Instant::now();
     let mut reactive = convert_to_r_f32(tex);
     let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    if reactive.iter().all(|&v| v == 0.0) {
+        error!("writer: reactive mask is all zeros (barrier state mismatch or empty resource)");
+    }
 
     let mut downscale_ms = 0.0;
     if should_downscale(w, h) {

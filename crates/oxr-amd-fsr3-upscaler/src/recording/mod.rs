@@ -13,7 +13,6 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
-use crate::dispatch;
 use crate::fsr3_types::FfxFsr3UpscalerDispatchDescription;
 use extractor::{estimate_slot_bytes, DeferredFramePacket, DeferredTextureData, ExtractorMessage};
 use readback::{is_depth_stencil_format, ReadbackPool, Slot};
@@ -812,7 +811,6 @@ pub unsafe fn post_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
         d.motion_vectors.description.height,
     );
 
-    // Reactive mask
     copy_slot(
         Slot::Reactive,
         d.reactive.resource,
