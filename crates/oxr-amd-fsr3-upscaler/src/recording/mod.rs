@@ -332,10 +332,8 @@ pub unsafe fn pre_dispatch(d: &FfxFsr3UpscalerDispatchDescription) {
 
                 state.drain_frames -= 1;
                 if state.drain_frames == 0 {
-                    info!("recording: drain complete, leaking pool (GPU safety)");
-                    if let Some(state) = guard.take() {
-                        std::mem::forget(state);
-                    }
+                    info!("recording: drain complete, releasing pool");
+                    guard.take(); // Drop — extractor holds cloned COM refs for in-flight readbacks
                 }
             }
         }
