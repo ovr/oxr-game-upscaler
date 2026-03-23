@@ -35,6 +35,16 @@ pub fn rcas_set(on: bool) {
     RCAS_ENABLED.store(on, Ordering::Relaxed);
 }
 
+static AA_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn aa_get() -> bool {
+    AA_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn aa_set(on: bool) {
+    AA_ENABLED.store(on, Ordering::Relaxed);
+}
+
 static DEBUG_VIEW: AtomicBool = AtomicBool::new(false);
 
 pub fn debug_view_get() -> bool {
