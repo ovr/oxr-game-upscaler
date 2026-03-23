@@ -1,6 +1,6 @@
 //! AA model inference via compute shaders.
 //!
-//! Port of AAPass.cpp from imba-test. 17 compute shaders, ~57K params,
+//! Port of AAPass.cpp from imba. 17 compute shaders, ~57K params,
 //! 26 dispatches per frame (prev encoder cached after frame 1).
 
 use std::sync::Mutex;
@@ -881,15 +881,23 @@ pub unsafe fn execute(
 
         cmd_list.Dispatch(groups_x, groups_y, 1);
 
-        // UAV barrier between dispatches
-        let mut barrier = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            ..Default::default()
+        // Targeted UAV barriers on our resources only (not NULL — NULL flushes ALL GPU UAV work
+        // including the game's, causing massive stalls under concurrent rendering).
+        let make_uav = |res: &ID3D12Resource| {
+            let mut b = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            };
+            b.Anonymous.UAV = std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::transmute_copy(res),
+            });
+            b
         };
-        barrier.Anonymous.UAV = std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-            pResource: std::mem::ManuallyDrop::new(None),
-        });
-        cmd_list.ResourceBarrier(&[barrier]);
+        cmd_list.ResourceBarrier(&[
+            make_uav(&state.feature_buffer),
+            make_uav(&state.gn_stats_buffer),
+            make_uav(&state.gn_partials_buffer),
+        ]);
     }
 
     // Save curr_temporal (buf3) → cache for next frame

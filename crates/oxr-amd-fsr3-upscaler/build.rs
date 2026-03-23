@@ -3,8 +3,8 @@ use std::path::Path;
 
 fn main() {
     let shader_dir = Path::new("src/upscalers/shaders");
-    // AA shaders come from the imba-test submodule
-    let aa_shader_dir = Path::new("../../vendor/imba-test/shaders/imba/aa");
+    // AA shaders come from the imba submodule
+    let aa_shader_dir = Path::new("../../vendor/imba/v0/aa/small/shaders");
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     // (path relative to shader_dir, entry, profile)

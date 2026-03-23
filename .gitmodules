@@ -1,3 +1,3 @@
-[submodule "vendor/imba-test"]
-	path = vendor/imba-test
-	url = git@github.com:ovr/imba-test.git
+[submodule "vendor/imba"]
+	path = vendor/imba
+	url = https://github.com/ovr/imba.git

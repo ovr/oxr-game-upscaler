@@ -263,7 +263,6 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
             if let Some(state) = aa_state {
                 if state.prev_frame_valid {
                     // ── Run AA inference ──
-
                     // Transition inputs → NON_PIXEL_SHADER_RESOURCE
                     apply_barriers(
                         &cmd_list,

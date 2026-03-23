@@ -174,14 +174,9 @@ pub unsafe extern "C" fn ffxFsr3UpscalerContextDispatch(
     recording::pre_dispatch(d);
 
     let result = if rw == uw && rh == uh {
-        info!("AA mode (no upscale), CopyResource passthrough");
         dispatch::dispatch_anti_aliasing(d)
     } else {
-        let start = std::time::Instant::now();
-        let result = dispatch::dispatch_upscale(d);
-        let elapsed = start.elapsed();
-        info!(elapsed_us = elapsed.as_micros(), "dispatch total");
-        result
+        dispatch::dispatch_upscale(d)
     };
 
     #[cfg(feature = "recording")]
