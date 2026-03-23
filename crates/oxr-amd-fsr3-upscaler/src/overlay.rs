@@ -11,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 use crate::gpu_pipeline::{self, get_srv_cpu_handle, get_srv_gpu_handle, GpuState};
 use crate::imgui_renderer::ImguiDx12Renderer;
-use crate::upscaler_type::{self, UpscalerType};
+use crate::upscaler_type::{self, AntiAliasingType, UpscalerType};
 
 const VK_HOME: i32 = 0x24;
 const VK_END: i32 = 0x23;
@@ -127,35 +127,61 @@ pub unsafe fn render_frame(
             .position([60.0, 400.0], Condition::Always)
             .flags(imgui::WindowFlags::NO_MOUSE_INPUTS)
             .build(|| {
-                // Upscaler radio buttons
-                let mut active = upscaler_type::get();
-                ui.text("Upscaler");
-                if ui.radio_button("Bilinear", &mut active, UpscalerType::Bilinear) {
-                    upscaler_type::set(active);
-                    info!("overlay: switched to {:?}", active);
-                }
-                if ui.radio_button("Lanczos", &mut active, UpscalerType::Lanczos) {
-                    upscaler_type::set(active);
-                    info!("overlay: switched to {:?}", active);
-                }
-                if ui.radio_button("SGSR", &mut active, UpscalerType::SGSR) {
-                    upscaler_type::set(active);
-                    info!("overlay: switched to {:?}", active);
-                }
-                if ui.radio_button("SGSRv2 (2Pass)", &mut active, UpscalerType::SGSRv2TwoPass) {
-                    upscaler_type::set(active);
-                    info!("overlay: switched to {:?}", active);
-                }
-                if ui.radio_button("SGSRv2 (3Pass)", &mut active, UpscalerType::SGSRv2) {
-                    upscaler_type::set(active);
-                    info!("overlay: switched to {:?}", active);
+                let mut aa_active = upscaler_type::aa_get();
+
+                // Anti-Aliasing
+                {
+                    ui.text("Anti-Aliasing");
+                    if ui.radio_button("AA: None", &mut aa_active, AntiAliasingType::None) {
+                        upscaler_type::aa_set(aa_active);
+                        info!("overlay: AA switched to {:?}", aa_active);
+                    }
+                    if ui.radio_button("IMBA v0", &mut aa_active, AntiAliasingType::ImbaV0) {
+                        upscaler_type::aa_set(aa_active);
+                        info!("overlay: AA switched to {:?}", aa_active);
+                    }
                 }
 
-                // RCAS checkbox
-                let mut rcas_on = upscaler_type::rcas_get();
-                if ui.checkbox("RCAS", &mut rcas_on) {
-                    upscaler_type::rcas_set(rcas_on);
-                    info!("overlay: rcas={}", rcas_on);
+                ui.separator();
+
+                // Upscaler
+                {
+                    let aa_mode = aa_active != AntiAliasingType::None;
+                    let mut active = upscaler_type::get();
+                    if aa_mode {
+                        ui.text_disabled("Upscaler (AA mode)");
+                    } else {
+                        ui.text("Upscaler");
+                    }
+
+                    let disabled = ui.begin_disabled(aa_mode);
+                    if ui.radio_button("Bilinear", &mut active, UpscalerType::Bilinear) {
+                        upscaler_type::set(active);
+                        info!("overlay: switched to {:?}", active);
+                    }
+                    if ui.radio_button("Lanczos", &mut active, UpscalerType::Lanczos) {
+                        upscaler_type::set(active);
+                        info!("overlay: switched to {:?}", active);
+                    }
+                    if ui.radio_button("SGSR", &mut active, UpscalerType::SGSR) {
+                        upscaler_type::set(active);
+                        info!("overlay: switched to {:?}", active);
+                    }
+                    if ui.radio_button("SGSRv2 (2Pass)", &mut active, UpscalerType::SGSRv2TwoPass) {
+                        upscaler_type::set(active);
+                        info!("overlay: switched to {:?}", active);
+                    }
+                    if ui.radio_button("SGSRv2 (3Pass)", &mut active, UpscalerType::SGSRv2) {
+                        upscaler_type::set(active);
+                        info!("overlay: switched to {:?}", active);
+                    }
+
+                    // RCAS checkbox
+                    let mut rcas_on = upscaler_type::rcas_get();
+                    if ui.checkbox("RCAS", &mut rcas_on) {
+                        upscaler_type::rcas_set(rcas_on);
+                        info!("overlay: rcas={}", rcas_on);
+                    }
                 }
 
                 ui.separator();

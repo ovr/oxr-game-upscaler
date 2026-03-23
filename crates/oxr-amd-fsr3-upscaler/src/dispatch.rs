@@ -235,10 +235,10 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
         }
     };
 
-    let aa_enabled = upscaler_type::aa_get();
+    let aa_type = upscaler_type::aa_get();
 
     // Try to run the AA model
-    if aa_enabled {
+    if matches!(aa_type, upscaler_type::AntiAliasingType::ImbaV0) {
         let depth_res = upscalers::borrow_resource(d.depth.resource);
         let mv_res = upscalers::borrow_resource(d.motion_vectors.resource);
 

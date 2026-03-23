@@ -35,14 +35,23 @@ pub fn rcas_set(on: bool) {
     RCAS_ENABLED.store(on, Ordering::Relaxed);
 }
 
-static AA_ENABLED: AtomicBool = AtomicBool::new(true);
-
-pub fn aa_get() -> bool {
-    AA_ENABLED.load(Ordering::Relaxed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiAliasingType {
+    None = 0,
+    ImbaV0 = 1,
 }
 
-pub fn aa_set(on: bool) {
-    AA_ENABLED.store(on, Ordering::Relaxed);
+static AA_TYPE: AtomicU8 = AtomicU8::new(AntiAliasingType::ImbaV0 as u8);
+
+pub fn aa_get() -> AntiAliasingType {
+    match AA_TYPE.load(Ordering::Relaxed) {
+        1 => AntiAliasingType::ImbaV0,
+        _ => AntiAliasingType::None,
+    }
+}
+
+pub fn aa_set(t: AntiAliasingType) {
+    AA_TYPE.store(t as u8, Ordering::Relaxed);
 }
 
 static DEBUG_VIEW: AtomicBool = AtomicBool::new(false);
