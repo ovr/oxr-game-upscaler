@@ -6,6 +6,7 @@ use crate::upscaler_type;
 use crate::upscalers::{self, DispatchContext};
 use tracing::{error, warn};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
 
 /// Main upscale dispatch: extract resources, run upscaler, post-fx chain, overlay.
 pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
@@ -168,18 +169,18 @@ pub unsafe fn dispatch_upscale(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     0 // FFX_OK
 }
 
-/// Color -> output copy for AA mode (render_size == output_size) with overlay support.
+/// AA mode dispatch: run neural AA model when enabled, else passthrough copy.
 pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> u32 {
     let cmd_list_raw = d.command_list;
     if cmd_list_raw.is_null() {
-        warn!("dispatch_aa_copy: null command list");
+        warn!("dispatch_aa: null command list");
         return 1;
     }
 
     let color_raw = d.color.resource;
     let output_raw = d.output.resource;
     if color_raw.is_null() || output_raw.is_null() {
-        warn!("dispatch_aa_copy: null color or output resource");
+        warn!("dispatch_aa: null color or output resource");
         return 1;
     }
 
@@ -189,7 +190,7 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
         ) {
             Some(borrowed) => borrowed.clone(),
             None => {
-                error!("dispatch_aa_copy: from_raw_borrowed failed for command list");
+                error!("dispatch_aa: from_raw_borrowed failed for command list");
                 return 1;
             }
         };
@@ -198,7 +199,7 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
         match <ID3D12Resource as windows::core::Interface>::from_raw_borrowed(&color_raw) {
             Some(borrowed) => borrowed.clone(),
             None => {
-                error!("dispatch_aa_copy: from_raw_borrowed failed for color resource");
+                error!("dispatch_aa: from_raw_borrowed failed for color resource");
                 return 1;
             }
         };
@@ -207,124 +208,435 @@ pub unsafe fn dispatch_anti_aliasing(d: &FfxFsr3UpscalerDispatchDescription) -> 
         match <ID3D12Resource as windows::core::Interface>::from_raw_borrowed(&output_raw) {
             Some(borrowed) => borrowed.clone(),
             None => {
-                error!("dispatch_aa_copy: from_raw_borrowed failed for output resource");
+                error!("dispatch_aa: from_raw_borrowed failed for output resource");
                 return 1;
             }
         };
 
     let output_w = d.output.description.width;
     let output_h = d.output.description.height;
+    let render_w = if d.render_size.width > 0 {
+        d.render_size.width
+    } else {
+        output_w
+    };
+    let render_h = if d.render_size.height > 0 {
+        d.render_size.height
+    } else {
+        output_h
+    };
 
-    // Barriers: color -> COPY_SOURCE, output -> COPY_DEST
-    apply_barriers(
+    let output_format = gpu_pipeline::ffx_format_to_dxgi(d.output.description.format);
+    let gpu = match gpu_pipeline::get_or_init(&cmd_list, output_format) {
+        Some(g) => g,
+        None => {
+            error!("dispatch_aa: GPU pipeline init failed");
+            return 1;
+        }
+    };
+
+    let aa_enabled = upscaler_type::aa_get();
+
+    // Try to run the AA model
+    if aa_enabled {
+        let depth_res = upscalers::borrow_resource(d.depth.resource);
+        let mv_res = upscalers::borrow_resource(d.motion_vectors.resource);
+
+        if depth_res.is_some() && mv_res.is_some() {
+            let depth_res = depth_res.unwrap();
+            let mv_res = mv_res.unwrap();
+
+            let color_format = gpu_pipeline::dxgi_typeless_to_typed(
+                gpu_pipeline::ffx_format_to_dxgi(d.color.description.format),
+            );
+            let color_format = if color_format == DXGI_FORMAT_UNKNOWN {
+                // Fallback: use the resource's own format
+                color_res.GetDesc().Format
+            } else {
+                color_format
+            };
+
+            let mut aa_guard =
+                upscalers::aa_pass::get_or_create(&gpu.device, render_w, render_h, color_format);
+            let aa_state = aa_guard.as_mut();
+
+            if let Some(state) = aa_state {
+                if state.prev_frame_valid {
+                    // ── Run AA inference ──
+
+                    // Transition inputs → NON_PIXEL_SHADER_RESOURCE
+                    apply_barriers(
+                        &cmd_list,
+                        &[
+                            resource_barrier_transition(
+                                &color_res,
+                                d.color.state,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ),
+                            resource_barrier_transition(
+                                &depth_res,
+                                d.depth.state,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ),
+                            resource_barrier_transition(
+                                &mv_res,
+                                d.motion_vectors.state,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ),
+                        ],
+                    );
+
+                    // Set shader-visible heap
+                    cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
+
+                    // Setup descriptors
+                    upscalers::aa_pass::setup_descriptors(
+                        gpu,
+                        state,
+                        &color_res,
+                        &depth_res,
+                        &mv_res,
+                        output_format,
+                    );
+
+                    // Convert jitter from NDC to pixel space
+                    let jitter_x = d.jitter_offset.x * render_w as f32 * 0.5;
+                    let jitter_y = d.jitter_offset.y * render_h as f32 * 0.5;
+                    let prev_jitter_x = state.prev_jitter_x;
+                    let prev_jitter_y = state.prev_jitter_y;
+
+                    // Execute AA pass
+                    upscalers::aa_pass::execute(
+                        &cmd_list,
+                        gpu,
+                        state,
+                        jitter_x,
+                        jitter_y,
+                        prev_jitter_x,
+                        prev_jitter_y,
+                    );
+
+                    // Copy AA output → game output
+                    apply_barriers(
+                        &cmd_list,
+                        &[
+                            resource_barrier_transition_d3d12(
+                                &state.output_texture,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            ),
+                            resource_barrier_transition(
+                                &output_res,
+                                d.output.state,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                        ],
+                    );
+                    cmd_list.CopyResource(&output_res, &state.output_texture);
+
+                    // Transition AA output back to common
+                    apply_barriers(
+                        &cmd_list,
+                        &[resource_barrier_transition_d3d12(
+                            &state.output_texture,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )],
+                    );
+
+                    // Copy current frame → prev for next dispatch
+                    apply_barriers(
+                        &cmd_list,
+                        &[
+                            resource_barrier_transition_d3d12(
+                                &state.prev_color,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_depth,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_motion,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                        ],
+                    );
+                    cmd_list.CopyResource(&state.prev_color, &color_res);
+                    cmd_list.CopyResource(&state.prev_depth, &depth_res);
+                    cmd_list.CopyResource(&state.prev_motion, &mv_res);
+
+                    // Restore all states
+                    apply_barriers(
+                        &cmd_list,
+                        &[
+                            resource_barrier_transition_d3d12(
+                                &color_res,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ffx_state_to_d3d12(d.color.state),
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &depth_res,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ffx_state_to_d3d12(d.depth.state),
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &mv_res,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ffx_state_to_d3d12(d.motion_vectors.state),
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_color,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_depth,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_motion,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ),
+                        ],
+                    );
+
+                    // Save current jitter for next frame
+                    state.prev_jitter_x = jitter_x;
+                    state.prev_jitter_y = jitter_y;
+
+                    // output is in COPY_DEST → transition to RENDER_TARGET for post-fx
+                    apply_barriers(
+                        &cmd_list,
+                        &[resource_barrier_transition_d3d12(
+                            &output_res,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        )],
+                    );
+
+                    // Drop AA guard before post-fx (no longer needed)
+                    drop(aa_guard);
+
+                    return finish_aa_postfx(&cmd_list, gpu, d, &output_res, output_w, output_h);
+                } else {
+                    // First frame: copy current → prev, passthrough
+                    apply_barriers(
+                        &cmd_list,
+                        &[
+                            resource_barrier_transition(
+                                &color_res,
+                                d.color.state,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            ),
+                            resource_barrier_transition(
+                                &depth_res,
+                                d.depth.state,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            ),
+                            resource_barrier_transition(
+                                &mv_res,
+                                d.motion_vectors.state,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_color,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_depth,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_motion,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                            resource_barrier_transition(
+                                &output_res,
+                                d.output.state,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                        ],
+                    );
+
+                    cmd_list.CopyResource(&state.prev_color, &color_res);
+                    cmd_list.CopyResource(&state.prev_depth, &depth_res);
+                    cmd_list.CopyResource(&state.prev_motion, &mv_res);
+                    cmd_list.CopyResource(&output_res, &color_res);
+
+                    state.prev_frame_valid = true;
+                    state.prev_jitter_x = d.jitter_offset.x * render_w as f32 * 0.5;
+                    state.prev_jitter_y = d.jitter_offset.y * render_h as f32 * 0.5;
+
+                    apply_barriers(
+                        &cmd_list,
+                        &[
+                            resource_barrier_transition_d3d12(
+                                &color_res,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                ffx_state_to_d3d12(d.color.state),
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &depth_res,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                ffx_state_to_d3d12(d.depth.state),
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &mv_res,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                ffx_state_to_d3d12(d.motion_vectors.state),
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_color,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_depth,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &state.prev_motion,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ),
+                            resource_barrier_transition_d3d12(
+                                &output_res,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            ),
+                        ],
+                    );
+
+                    drop(aa_guard);
+                    return finish_aa_postfx(&cmd_list, gpu, d, &output_res, output_w, output_h);
+                }
+            }
+        }
+    }
+
+    // Fallback: simple copy passthrough
+    dispatch_aa_copy(
         &cmd_list,
+        d,
+        &color_res,
+        &output_res,
+        gpu,
+        output_w,
+        output_h,
+    )
+}
+
+/// Simple copy fallback for AA mode when model is disabled or resources unavailable.
+unsafe fn dispatch_aa_copy(
+    cmd_list: &ID3D12GraphicsCommandList,
+    d: &FfxFsr3UpscalerDispatchDescription,
+    color_res: &ID3D12Resource,
+    output_res: &ID3D12Resource,
+    gpu: &gpu_pipeline::GpuState,
+    output_w: u32,
+    output_h: u32,
+) -> u32 {
+    apply_barriers(
+        cmd_list,
         &[
-            resource_barrier_transition(
-                &color_res,
-                d.color.state,
+            resource_barrier_transition(color_res, d.color.state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            resource_barrier_transition(output_res, d.output.state, D3D12_RESOURCE_STATE_COPY_DEST),
+        ],
+    );
+
+    cmd_list.CopyResource(output_res, color_res);
+
+    apply_barriers(
+        cmd_list,
+        &[
+            resource_barrier_transition_d3d12(
+                color_res,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ffx_state_to_d3d12(d.color.state),
             ),
-            resource_barrier_transition(
-                &output_res,
-                d.output.state,
+            resource_barrier_transition_d3d12(
+                output_res,
                 D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
             ),
         ],
     );
 
-    cmd_list.CopyResource(&output_res, &color_res);
+    finish_aa_postfx(cmd_list, gpu, d, output_res, output_w, output_h)
+}
 
-    let output_format = gpu_pipeline::ffx_format_to_dxgi(d.output.description.format);
-    let gpu = gpu_pipeline::get_or_init(&cmd_list, output_format);
+/// Post-processing, overlay, and final barrier restore for AA dispatch.
+/// Expects output in RENDER_TARGET state.
+unsafe fn finish_aa_postfx(
+    cmd_list: &ID3D12GraphicsCommandList,
+    gpu: &gpu_pipeline::GpuState,
+    d: &FfxFsr3UpscalerDispatchDescription,
+    output_res: &ID3D12Resource,
+    output_w: u32,
+    output_h: u32,
+) -> u32 {
+    gpu.device
+        .CreateRenderTargetView(output_res, None, gpu_pipeline::get_rtv_cpu_handle(gpu, 0));
 
-    if let Some(gpu) = gpu {
-        apply_barriers(
-            &cmd_list,
-            &[
-                resource_barrier_transition_d3d12(
-                    &color_res,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ffx_state_to_d3d12(d.color.state),
-                ),
-                resource_barrier_transition_d3d12(
-                    &output_res,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                ),
-            ],
-        );
+    let viewport = D3D12_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: output_w as f32,
+        Height: output_h as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    let scissor = windows::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: output_w as i32,
+        bottom: output_h as i32,
+    };
+    cmd_list.RSSetViewports(&[viewport]);
+    cmd_list.RSSetScissorRects(&[scissor]);
 
-        gpu.device.CreateRenderTargetView(
-            &output_res,
-            None,
-            gpu_pipeline::get_rtv_cpu_handle(gpu, 0),
-        );
+    let rtv_handle = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
+    cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
 
-        let viewport = D3D12_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: output_w as f32,
-            Height: output_h as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        let scissor = windows::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: output_w as i32,
-            bottom: output_h as i32,
-        };
-        cmd_list.RSSetViewports(&[viewport]);
-        cmd_list.RSSetScissorRects(&[scissor]);
+    let post_ctx = PostContext {
+        cmd_list,
+        gpu,
+        d,
+        output_res,
+        output_w,
+        output_h,
+    };
 
-        let rtv_handle = gpu_pipeline::get_rtv_cpu_handle(gpu, 0);
-        cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
-
-        // --- Post-processing chain ---
-        let post_ctx = PostContext {
-            cmd_list: &cmd_list,
-            gpu,
-            d,
-            output_res: &output_res,
-            output_w,
-            output_h,
-        };
-
-        if post_processing::rcas::is_enabled() {
-            post_processing::rcas::apply(&post_ctx);
-        }
-
-        if post_processing::debug_view::is_enabled() {
-            post_processing::debug_view::apply(&post_ctx);
-        }
-
-        overlay::render_frame(&cmd_list, gpu, output_w, output_h);
-
-        apply_barriers(
-            &cmd_list,
-            &[resource_barrier_transition_d3d12(
-                &output_res,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                ffx_state_to_d3d12(d.output.state),
-            )],
-        );
-    } else {
-        apply_barriers(
-            &cmd_list,
-            &[
-                resource_barrier_transition_d3d12(
-                    &color_res,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ffx_state_to_d3d12(d.color.state),
-                ),
-                resource_barrier_transition_d3d12(
-                    &output_res,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    ffx_state_to_d3d12(d.output.state),
-                ),
-            ],
-        );
+    if post_processing::rcas::is_enabled() {
+        post_processing::rcas::apply(&post_ctx);
     }
+
+    if post_processing::debug_view::is_enabled() {
+        post_processing::debug_view::apply(&post_ctx);
+    }
+
+    // Set descriptor heap for imgui
+    cmd_list.SetDescriptorHeaps(&[Some(gpu.srv_heap.clone())]);
+    overlay::render_frame(cmd_list, gpu, output_w, output_h);
+
+    apply_barriers(
+        cmd_list,
+        &[resource_barrier_transition_d3d12(
+            output_res,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ffx_state_to_d3d12(d.output.state),
+        )],
+    );
 
     0 // FFX_OK
 }

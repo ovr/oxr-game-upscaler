@@ -1,3 +1,4 @@
+pub mod aa_pass;
 pub mod sgsr2_three_pass;
 pub mod sgsr2_two_pass;
 pub mod simple;
